@@ -1,9 +1,6 @@
-Flask>=3.0
+# Needed only for the command-line engine (check_project.py).
+# The browser tool (pid-checker.html) needs nothing installed.
 PyMuPDF>=1.24
 pandas>=2.0
 openpyxl>=3.1
 xlrd>=2.0
-# Optional OCR fallback for scanned/raster P&ID pages.
-# Requires the system `tesseract` binary to also be installed.
-pytesseract>=0.3.10
-Pillow>=10.0

@@ -2,28 +2,23 @@
 Calibrated P&ID-vs-list reconciliation for the 2233 Kathleen Valley project
 (Lycopodium drawings + Line List / Valve List / MEL).
 
-This encodes the conventions confirmed against the sample files:
+Output is organised as one block per item type, with the value read from the
+P&ID beside the value from the list, so disagreements can be eyeballed (and are
+red-filled in the Excel report):
 
-  Drawing number : in the title block, formatted  AREA-FP-NNN  (e.g. 120-FP-001)
-  Equipment tags : AREA-TYPE-NNN where TYPE is a MEL equipment code (e.g. 121-CV-014)
-  Valve tags     : sized  <DN>V<nn><L>  (e.g. 50V11A)  and pattern  AREA-VV-NNN
-  Line tags      : <SIZE>-<SERV>-<SPEC>-<NNN>  (e.g. 25-PW-S31-027)
+  Equipment : PID equip-no | MEL equip-no | PID description | MEL description
+  Valves    : PID valve tag | list valve tag | PID size-code | list size-code
+  Lines     : PID line-no  | list line-no  | list P&ID      | sheet(s) found on
 
-Scope decisions (per project owner):
-  * Valves are reconciled by their physical VV / sized tag (instrument YV/SV
-    loop tags are out of scope for now).
-  * ANY tagged item on a P&ID that is not in the relevant list is a discrepancy,
-    including CCTV cameras (CA) and stockpiles (SP) absent from the MEL.
-  * The drawing number is read from the title block by position (the FP word
-    nearest the bottom of the sheet), so cross-references to other drawings on
-    the same sheet do not get mistaken for the sheet's own number.
-  * Equipment counts as belonging to a sheet only if its tag appears at least
-    twice on it (genuine equipment is labelled at the symbol and in the
-    reference block; cross-references from other sheets appear once). This is
-    what stops equipment being paired with the wrong P&ID.
-  * For equipment, the drawing it is found on is compared against the MEL's
-    "P&ID No." column; a mismatch is flagged ("P&ID MISMATCH"). The MEL
-    "Equipment Name" is carried through as a Description column.
+Conventions confirmed against the sample files:
+  Drawing number : title block, AREA-FP-NNN (read by position: nearest the
+                   bottom of the sheet, so cross-references aren't mistaken for it)
+  Equipment tags : AREA-TYPE-NNN; must appear >=2 times on a sheet to count as
+                   belonging to it (genuine equipment is labelled at the symbol
+                   and in the reference block; cross-references appear once)
+  Valve tags     : sized <DN>V<nn><L> (e.g. 25V41A) AND unique AREA-VV-NNN
+                   (e.g. 120-VV-008); the two are paired on the drawing by proximity
+  Line tags      : <SIZE>-<SERV>-<SPEC>-<NNN> (e.g. 25-PW-S31-027)
 
 Run:  python check_project.py PID.pdf Line_List.xlsx Valve_List.xlsx MEL.xlsx [out.xlsx]
 """
@@ -42,14 +37,15 @@ RE_VV   = re.compile(r"\b(\d{3})-VV-(\d{3})\b")
 RE_VSZ  = re.compile(r"\b(\d{2,4})V(\d{2})([A-Z])\b")
 RE_LINE = re.compile(r"\b(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})\b")
 RE_DWG  = re.compile(r"\b(\d{3}-FP-\d{3})\b")
-RE_FP_FULL = re.compile(r"^\d{3}-FP-\d{3}$")  # a whole word that is a drawing no.
+RE_FP_FULL  = re.compile(r"^\d{3}-FP-\d{3}$")
+RE_VSZ_FULL = re.compile(r"^\d{2,4}V\d{2}[A-Z]$")
+RE_VV_FULL  = re.compile(r"^\d{3}-VV-\d{3}$")
 
-# Codes that are NOT mechanical equipment even though they fit AREA-XX-NNN.
-NON_EQUIPMENT_CODES = {"FP"}  # drawing references; VV handled separately
+NON_EQUIPMENT_CODES = {"FP"}   # drawing references; VV handled separately
+ONLY_ONCE = "Only labelled once — verify (possible cross-reference)"
 
 
 def _find_col(columns, *wanted):
-    """Find a column by fuzzy, whitespace/case-insensitive match."""
     norm = lambda s: "".join(str(s).lower().split()).replace("_", "").replace("-", "")
     targets = [norm(w) for w in wanted]
     for c in columns:
@@ -58,26 +54,116 @@ def _find_col(columns, *wanted):
     return None
 
 
+def _norm_desc(s):
+    """Loose normalisation for comparing free-text descriptions."""
+    return re.sub(r"[^A-Z0-9]", "", str(s).upper())
+
+
+def descriptions_match(pid_desc, mel_desc):
+    a, b = _norm_desc(pid_desc), _norm_desc(mel_desc)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+# --------------------------------------------------------------------------
+# positional extraction from a page
+# --------------------------------------------------------------------------
 def drawing_number(page):
-    """The sheet's own drawing number = the NNN-FP-NNN word nearest the bottom
-    of the page (the title block), tie-broken to the right. This ignores the
-    many cross-references to other drawings elsewhere on the sheet."""
+    """Sheet's own number = the FP word nearest the bottom (title block)."""
     fps = [w for w in page.get_text("words") if RE_FP_FULL.match(w[4])]
     if not fps:
         return None
-    # words are (x0, y0, x1, y1, text, ...). Largest y0 = lowest on page.
-    fps.sort(key=lambda w: (w[1], w[0]))
+    fps.sort(key=lambda w: (w[1], w[0]))   # largest y0 (lowest) wins, then right-most
     return fps[-1][4]
 
 
+def _is_tagish(t):
+    t = t.strip().upper()
+    return bool(RE_EQ.fullmatch(t) or re.match(r"^\d{2,4}-[A-Z]{2,3}-[A-Z0-9]", t)
+                or re.fullmatch(r"\d{1,4}", t) or re.fullmatch(r"[A-Z]{1,5}\s?\d{2,4}", t))
+
+
+def _is_noise_line(t):
+    """Lines that are not part of an equipment description (drawing/vendor refs)."""
+    u = t.strip().upper()
+    return bool(re.search(r"-DRG-|-ME-|\bVENDOR\b|\bPACKAGE\b", u)
+                or re.match(r"^\d{3,4}-\d", u))
+
+
+def _desc_reliable(d):
+    """A description we trust enough to red-flag a mismatch on: has real words,
+    isn't a stray code/ref."""
+    if not d or _is_noise_line(d):
+        return False
+    return len(re.findall(r"[A-Z]{3,}", d.upper())) >= 2
+
+
+def equipment_descriptions(page):
+    """tag -> description, read from the reference block (the 1-3 tightly stacked
+    lines directly beneath the tag at the same x). The symbol occurrence has no
+    such block, so the longest clean description found across occurrences wins."""
+    H = page.rect.height
+    lines = []
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            txt = " ".join(s["text"] for s in l["spans"]).strip()
+            if txt:
+                x0, y0, x1, y1 = l["bbox"]
+                lines.append((x0, y0, x1, y1, txt))
+    out = {}
+    for s in lines:
+        tag = s[4].strip().upper()
+        m = RE_EQ.fullmatch(tag)
+        if not m or m.group(2) in NON_EQUIPMENT_CODES or m.group(2) == "VV":
+            continue
+        ex0, ey0 = s[0], s[1]
+        desc, cur = [], s[3]
+        for t in sorted([l for l in lines if l[1] > ey0], key=lambda z: z[1]):
+            if abs(t[0] - ex0) > 40 or t[1] - cur > 0.02 * H or t[1] < cur - 1:
+                continue
+            if _is_tagish(t[4]) or _is_noise_line(t[4]):
+                break          # stop at the next tag or a vendor/drawing-ref line
+            desc.append(t[4].strip())
+            cur = t[3]
+            if len(desc) >= 3:
+                break
+        d = " ".join(desc)
+        if len(d) > len(out.get(tag, "")):
+            out[tag] = d
+    return out
+
+
+def valve_pairs(page):
+    """unique valve tag (AREA-VV-NNN) -> nearest sized code (<DN>V<nn><L>) on the
+    sheet, when within ~5% of sheet width (they sit together at the valve symbol)."""
+    ws = page.get_text("words")
+    W = page.rect.width
+    sized = [(w[4], (w[0] + w[2]) / 2, (w[1] + w[3]) / 2) for w in ws if RE_VSZ_FULL.match(w[4])]
+    out = {}
+    for w in ws:
+        if not RE_VV_FULL.match(w[4]):
+            continue
+        vx, vy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+        best, bd = "", 1e9
+        for stag, sx, sy in sized:
+            dd = ((vx - sx) ** 2 + (vy - sy) ** 2) ** 0.5
+            if dd < bd:
+                bd, best = dd, stag
+        if best and bd < 0.05 * W:
+            out[w[4]] = best
+    return out
+
+
+# --------------------------------------------------------------------------
+# reference data from the lists
+# --------------------------------------------------------------------------
 def load_references(line_path, valve_path, mel_path):
-    """Build the identifier sets each P&ID tag is checked against."""
-    # MEL equipment + the set of valid equipment type codes + declared P&ID.
     mel = pd.read_excel(mel_path, sheet_name="Equipment List", header=0, dtype=str)
     equipment, codes, declared_pid, names = set(), set(), {}, {}
     eq_col = _find_col(mel.columns, "Equipment No.") or "Equipment No."
     pid_col = _find_col(mel.columns, "P&ID No.", "P&ID\nNo.", "PID No.")
-    name_col = _find_col(mel.columns, "Equipment Name", "Description", "Equipment Description")
+    name_col = _find_col(mel.columns, "Equipment Name", "Description")
     for _, row in mel.iterrows():
         m = RE_EQ.fullmatch(str(row.get(eq_col)).strip().upper())
         if not m:
@@ -93,12 +179,21 @@ def load_references(line_path, valve_path, mel_path):
             if v and v.lower() != "nan":
                 names[m.group(0)] = v
 
-    # Valve identifiers: union of every identifier-bearing column / sheet.
-    valves = set()
-    main = pd.read_excel(valve_path, sheet_name="2233-PLST-007", header=0, dtype=str)
+    # Valves: the unique VV tag and its paired size code, plus the full id set.
+    valves, vv_set, vv_to_size = set(), set(), {}
+    vmain = pd.read_excel(valve_path, sheet_name="2233-PLST-007", header=0, dtype=str)
+    patt_col = _find_col(vmain.columns, "PATTERN")
+    name_lk = _find_col(vmain.columns, "Valve Name Lookup")
     for col in ("Valve Identifier", "Valve Name Lookup", "PATTERN"):
-        if col in main.columns:
-            valves |= {str(v).strip().upper() for v in main[col].dropna()}
+        if col in vmain.columns:
+            valves |= {str(v).strip().upper() for v in vmain[col].dropna()}
+    for _, r in vmain.iterrows():
+        patt = str(r.get(patt_col)).strip().upper() if patt_col else ""
+        if RE_VV_FULL.match(patt):
+            vv_set.add(patt)
+            nm = str(r.get(name_lk)).strip().upper() if name_lk else ""
+            if RE_VSZ_FULL.match(nm):
+                vv_to_size[patt] = nm
     for sheet, col in (("Actuated Valves", "TAG"), ("Actuated Valves", "Valve Code"),
                        ("Manual Valves", "Valve Tag")):
         try:
@@ -108,55 +203,56 @@ def load_references(line_path, valve_path, mel_path):
             pass
     valves = {v for v in valves if v and v not in {"NAN", "-", "SPARE"}}
 
-    # Line list: keys of (serv, spec, num) and (serv, num) that exist.
+    # Lines: existence keys + which P&ID(s) the list assigns each line to.
     ll = pd.read_excel(line_path, sheet_name="Line List", header=0, dtype=str).iloc[1:]
-    serv_num, serv_spec_num = set(), set()
+    serv_num, serv_spec_num, line_pid = set(), set(), {}
+    pidc = _find_col(ll.columns, "P&ID", "PID")
 
-    def add(serv, spec, num):
+    def add(serv, spec, num, pids):
         serv = str(serv).strip().upper()
         num = re.sub(r"\D", "", str(num))
         if not serv or not num:
             return
-        num = str(int(num))  # strip leading zeros (e.g. 027 -> 27) for consistent keys
+        num = str(int(num))
         serv_num.add((serv, num))
+        line_pid.setdefault((serv, num), set()).update(pids)
         for sp in re.split(r"[\s/\n]+", str(spec).upper()):
             if sp.strip() and sp != "NAN":
                 serv_spec_num.add((serv, sp.strip(), num))
+                line_pid.setdefault((serv, sp.strip(), num), set()).update(pids)
 
     for _, r in ll.iterrows():
-        add(r.get("SERV CODE"), r.get("SPEC"), r.get("LINE No."))
-        for c in ll.columns:  # also harvest fully-written line numbers in cells
+        pids = set(RE_DWG.findall(str(r.get(pidc)).upper())) if pidc else set()
+        add(r.get("SERV CODE"), r.get("SPEC"), r.get("LINE No."), pids)
+        for c in ll.columns:
             for m in RE_LINE.finditer(str(r.get(c)).upper()):
                 serv_num.add((m.group(2), str(int(m.group(4)))))
                 serv_spec_num.add((m.group(2), m.group(3), str(int(m.group(4)))))
 
     return {"equipment": equipment, "codes": codes, "valves": valves,
+            "vv_set": vv_set, "vv_to_size": vv_to_size,
             "serv_num": serv_num, "serv_spec_num": serv_spec_num,
-            "declared_pid": declared_pid, "names": names}
+            "line_pid": line_pid, "declared_pid": declared_pid, "names": names}
 
 
 def page_tags(text, codes):
-    """Parse one page's text into:
-       valves (set), lines (set), eq_counts (Counter of MEL-code equipment),
-       other_counts (Counter of AREA-XX-NNN tags whose type isn't a MEL code).
-    Counts are raw occurrences; the twice-rule is applied later, across pages."""
     T = text.upper()
     lines = {m.group(0) for m in RE_LINE.finditer(T)}
-    valves = set()
+    valves, vvs = set(), set()
     eq_counts, other_counts = Counter(), Counter()
     for m in RE_EQ.finditer(T):
         code, tag = m.group(2), m.group(0)
         if code in NON_EQUIPMENT_CODES:
             continue
         if code == "VV":
-            valves.add(tag)
+            vvs.add(tag)
         elif code in codes:
             eq_counts[tag] += 1
         else:
             other_counts[tag] += 1
     for m in RE_VSZ.finditer(T):
         valves.add(m.group(0))
-    return valves, lines, eq_counts, other_counts
+    return valves, vvs, lines, eq_counts, other_counts
 
 
 def line_in_list(tag, ref):
@@ -165,95 +261,145 @@ def line_in_list(tag, ref):
     return (s, sp, n) in ref["serv_spec_num"] or (s, n) in ref["serv_num"]
 
 
-def analyze(pdf_path, line_path, valve_path, mel_path):
-    """Run the reconciliation and return (full_df, discrepancies_df, summary_df).
+def _line_pids(tag, ref):
+    m = RE_LINE.fullmatch(tag)
+    s, sp, n = m.group(2), m.group(3), str(int(m.group(4)))
+    return ref["line_pid"].get((s, sp, n)) or ref["line_pid"].get((s, n)) or set()
 
-    Pure analysis — no files written — so both the CLI and the web app can call
-    it and present the results however they like.
-    """
+
+# --------------------------------------------------------------------------
+# main analysis -> one table (with a red-fill mask) per item type
+# --------------------------------------------------------------------------
+def analyze(pdf_path, line_path, valve_path, mel_path):
     ref = load_references(line_path, valve_path, mel_path)
     declared, names = ref["declared_pid"], ref["names"]
 
-    ONLY_ONCE = "Only labelled once — verify (possible cross-reference)"
-
-    # ---- pass 1: read every page and tally occurrences -------------------
-    pages = []
-    homes = {}   # tag -> set of drawings where it is labelled >=2 times (its home)
+    # ---- pass 1: read every page ----
+    pages, homes = [], {}
     with fitz.open(pdf_path) as doc:
         for page in doc:
             dwg = drawing_number(page) or f"(page {page.number + 1})"
-            valves, lines, eq_counts, other_counts = page_tags(
+            valves, vvs, lines, eq_counts, other_counts = page_tags(
                 page.get_text("text"), ref["codes"])
-            pages.append((dwg, valves, lines, eq_counts, other_counts))
+            pages.append({
+                "dwg": dwg, "vvs": vvs, "lines": lines,
+                "eq": eq_counts, "other": other_counts,
+                "desc": equipment_descriptions(page),
+                "vpairs": valve_pairs(page),
+            })
             for tag, c in (eq_counts | other_counts).items():
                 if c >= 2:
                     homes.setdefault(tag, set()).add(dwg)
 
-    # ---- pass 2: build rows ---------------------------------------------
-    rows = []
-    for dwg, valves, lines, eq_counts, other_counts in pages:
-        for tag in sorted(eq_counts):
+    eq_rows, eq_mask = [], []
+    vl_rows, vl_mask = [], []
+    ln_rows, ln_mask = [], []
+    ot_rows = []
+
+    # ---- pass 2 ----
+    for pg in pages:
+        dwg = pg["dwg"]
+
+        # Equipment: PID no | MEL no | PID descr | MEL descr | Notes
+        for tag in sorted(pg["eq"]):
             note = ""
-            if eq_counts[tag] < 2:
-                if tag in homes:
-                    continue            # cross-reference; real home captured elsewhere
-                note = ONLY_ONCE        # never labelled twice anywhere -> flag for review
-            if tag not in ref["equipment"]:
-                status = "NOT IN MEL"
-            elif tag in declared and declared[tag] != dwg:
-                status = f"P&ID MISMATCH (MEL says {declared[tag]})"
-            else:
-                status = "IN LIST"
-            rows.append([dwg, "Equipment", tag, "MEL", status, note])
-        for tag in sorted(other_counts):
-            note = ""
-            if other_counts[tag] < 2:
+            if pg["eq"][tag] < 2:
                 if tag in homes:
                     continue
                 note = ONLY_ONCE
-            rows.append([dwg, "Other", tag, "MEL", "NOT IN MEL (untracked type)", note])
-        for tag in sorted(valves):
-            ok = tag in ref["valves"]
-            rows.append([dwg, "Valve", tag, "Valve List",
-                         "IN LIST" if ok else "NOT IN VALVE LIST", ""])
-        for tag in sorted(lines):
-            ok = line_in_list(tag, ref)
-            rows.append([dwg, "Line", tag, "Line List",
-                         "IN LIST" if ok else "NOT IN LINE LIST", ""])
+            in_mel = tag in ref["equipment"]
+            if not in_mel:
+                note = (note + "; " if note else "") + "not in MEL"
+            elif tag in declared and declared[tag] != dwg:
+                note = (note + "; " if note else "") + f"MEL P&ID = {declared[tag]}"
+            pid_desc = pg["desc"].get(tag, "")
+            mel_desc = names.get(tag, "")
+            desc_bad = (in_mel and _desc_reliable(pid_desc) and bool(mel_desc)
+                        and not descriptions_match(pid_desc, mel_desc))
+            eq_rows.append([dwg, tag, tag if in_mel else "", pid_desc, mel_desc, note])
+            eq_mask.append([False, False, not in_mel, desc_bad, desc_bad, bool(note)])
 
-    df = pd.DataFrame(rows, columns=["P&ID", "Category", "Tag",
-                                     "Checked Against", "Status", "Notes"])
-    # an item needs attention if it isn't cleanly in its list, or carries a note
-    disc = df[(df["Status"] != "IN LIST") | (df["Notes"] != "")].reset_index(drop=True)
+        for tag in sorted(pg["other"]):
+            note = ""
+            if pg["other"][tag] < 2:
+                if tag in homes:
+                    continue
+                note = ONLY_ONCE
+            ot_rows.append([dwg, tag, "NOT IN MEL (untracked type)", note])
+
+        # Valves: PID tag | list tag | PID size | list size | Notes
+        for vv in sorted(pg["vvs"]):
+            in_list = vv in ref["vv_set"] or vv in ref["valves"]
+            pid_size = pg["vpairs"].get(vv, "")
+            list_size = ref["vv_to_size"].get(vv, "")
+            size_bad = bool(pid_size) and bool(list_size) and pid_size != list_size
+            note = "" if in_list else "not in valve list"
+            vl_rows.append([dwg, vv, vv if in_list else "", pid_size, list_size, note])
+            vl_mask.append([False, False, not in_list, size_bad, size_bad, bool(note)])
+
+        # Lines: PID no | list no | list P&ID | sheet found on | Notes
+        for tag in sorted(pg["lines"]):
+            ok = line_in_list(tag, ref)
+            pids = _line_pids(tag, ref)
+            on_listed_pid = (not pids) or (dwg in pids)
+            note = "" if ok else "not in line list"
+            if ok and pids and not on_listed_pid:
+                note = "drawn on a sheet not in the line-list P&ID"
+            ln_rows.append([dwg, tag, tag if ok else "",
+                            ", ".join(sorted(pids)), dwg, note])
+            ln_mask.append([False, False, not ok, not on_listed_pid, not on_listed_pid, bool(note)])
+
+    eq_cols = ["P&ID", "PID Equip No", "MEL Equip No", "PID Description", "MEL Description", "Notes"]
+    vl_cols = ["P&ID", "PID Valve Tag", "List Valve Tag", "PID Size Code", "List Size Code", "Notes"]
+    ln_cols = ["P&ID (found on)", "PID Line No", "List Line No", "List P&ID", "Sheet Found On", "Notes"]
+    ot_cols = ["P&ID", "Tag", "Status", "Notes"]
+
+    tables = {
+        "Equipment": pd.DataFrame(eq_rows, columns=eq_cols),
+        "Valves":    pd.DataFrame(vl_rows, columns=vl_cols),
+        "Lines":     pd.DataFrame(ln_rows, columns=ln_cols),
+        "Other":     pd.DataFrame(ot_rows, columns=ot_cols),
+    }
+    masks = {
+        "Equipment": pd.DataFrame(eq_mask, columns=eq_cols),
+        "Valves":    pd.DataFrame(vl_mask, columns=vl_cols),
+        "Lines":     pd.DataFrame(ln_mask, columns=ln_cols),
+        "Other":     pd.DataFrame([[False] * len(ot_cols) for _ in ot_rows], columns=ot_cols),
+    }
+    flagged = sum(int(m.any(axis=1).sum()) for m in masks.values()) + len(ot_rows)
     summary = pd.DataFrame({
         "Metric": ["P&ID pages", "Equipment found", "Valves found", "Lines found",
-                   "Other tagged items", "Labelled once (verify)",
-                   "DISCREPANCIES / items to review"],
-        "Value": [df["P&ID"].nunique(),
-                  int((df.Category == "Equipment").sum()),
-                  int((df.Category == "Valve").sum()),
-                  int((df.Category == "Line").sum()),
-                  int((df.Category == "Other").sum()),
-                  int((df.Notes != "").sum()),
-                  len(disc)],
+                   "Other tagged items", "Rows needing review"],
+        "Value": [len({p["dwg"] for p in pages}), len(eq_rows), len(vl_rows),
+                  len(ln_rows), len(ot_rows), flagged],
     })
-    return df, disc, summary
+    return {"tables": tables, "masks": masks, "summary": summary}
 
 
-def write_report(df, disc, summary, out_path):
-    """Write the three result tables to an Excel workbook."""
+def write_report(result, out_path):
+    """Write one sheet per item type, red-filling cells flagged in the mask."""
+    from openpyxl.styles import PatternFill
+    red = PatternFill("solid", fgColor="FFC7CE")
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        summary.to_excel(xw, sheet_name="Summary", index=False)
-        disc.to_excel(xw, sheet_name="Discrepancies", index=False)
-        df.to_excel(xw, sheet_name="Full PID Inventory", index=False)
+        result["summary"].to_excel(xw, sheet_name="Summary", index=False)
+        for name in ("Equipment", "Valves", "Lines", "Other"):
+            df = result["tables"][name]
+            df.to_excel(xw, sheet_name=name, index=False)
+            mask = result["masks"][name]
+            ws = xw.sheets[name]
+            for ri in range(len(df)):
+                for ci in range(len(df.columns)):
+                    if bool(mask.iat[ri, ci]):
+                        ws.cell(row=ri + 2, column=ci + 1).fill = red
 
 
 def check(pdf_path, line_path, valve_path, mel_path, out_path="PID_Check_Report.xlsx"):
-    """CLI convenience: analyze and write the Excel report in one call."""
-    df, disc, summary = analyze(pdf_path, line_path, valve_path, mel_path)
-    write_report(df, disc, summary, out_path)
-    print(f"Wrote {out_path}: {len(df)} tags, {len(disc)} discrepancies")
-    return df, disc
+    result = analyze(pdf_path, line_path, valve_path, mel_path)
+    write_report(result, out_path)
+    t = result["tables"]
+    print(f"Wrote {out_path}: {len(t['Equipment'])} equipment, "
+          f"{len(t['Valves'])} valves, {len(t['Lines'])} lines")
+    return result
 
 
 if __name__ == "__main__":

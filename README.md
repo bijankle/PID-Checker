@@ -1,74 +1,47 @@
 # PID-Checker
 
-A small web app that checks **P&ID drawings** against the project's engineering
-lists and flags anything that appears on a drawing but is **missing from the
-matching list**.
+Checks **P&ID drawings** against the project's engineering lists and shows, side
+by side, the value read from the **P&ID** next to the value from the **MEL /
+Line List / Valve List** — with mismatches highlighted in red.
 
-It reads every tag off the P&ID PDF and reconciles:
+There are two ways to run it:
 
-- **Equipment** (`AREA-TYPE-NNN`, e.g. `121-CV-014`) against the **MEL**
-- **Valves** (sized `50V11A` and pattern `120-VV-003`) against the **Valve List**
-- **Lines** (`SIZE-SERV-SPEC-NNN`, e.g. `25-PW-S31-027`) against the **Line List**
+- **`pid-checker.html`** — the easy one. Double-click to open in your browser,
+  drag in the P&ID PDF + the three Excel lists, get the report on screen and a
+  downloadable Excel. Nothing to install (needs internet the first time it's
+  opened, to load two helper libraries).
+- **`check_project.py`** — the command-line engine (also the reference the
+  browser tool is validated against).
 
-Anything tagged on a drawing whose type isn't tracked (e.g. CCTV cameras `CA`)
-is also reported as a discrepancy.
+## What it compares
 
-## Easiest: the single-file version (no install)
+Output is one block per item type, PID value beside list value:
 
-Open **`pid-checker.html`** by double-clicking it — it runs in your web browser
-with nothing to install. Drag the four files (P&ID PDF, Line List, Valve List,
-MEL) onto the page and click **Run consistency check**. You get the discrepancies
-on screen and a **Download Excel report** button. It needs an internet connection
-the first time you open it (to fetch two helper libraries).
+| Block | Columns |
+|---|---|
+| **Equipment** | PID equip-no · MEL equip-no · PID description · MEL description |
+| **Valves** | PID valve tag · list valve tag · PID size-code · list size-code |
+| **Lines** | PID line-no · list line-no · list P&ID · sheet(s) found on |
 
-The two options below (web app / command line) are for when you want to run it
-from your own Python environment instead.
+How the reading is made reliable:
 
-## How to run the web app (the Python way)
+- **Drawing number** is read from the **title block by position** (the `AREA-FP-NNN`
+  word nearest the bottom of the sheet), so cross-references to other drawings
+  aren't mistaken for the sheet's own number.
+- **Equipment** counts as belonging to a sheet only if its tag appears **twice**
+  (genuine equipment is labelled at the symbol *and* in the reference block;
+  cross-references appear once). Tags labelled once anywhere are listed with a
+  "verify" note rather than dropped.
+- **Equipment descriptions** are read from the reference block; the **valve
+  size-code and unique VV tag** are paired by proximity on the drawing.
+- Equipment found on a sheet is also checked against the MEL's **`P&ID No.`**.
 
-You need this **one-time setup**:
-
-1. **Install Python** from https://www.python.org/downloads/ (tick *"Add Python
-   to PATH"* during install).
-2. Open a terminal **in this project folder**:
-   - Windows: type `cmd` in the folder's address bar and press Enter.
-   - Mac: right-click the folder → *New Terminal at Folder*.
-3. Install the libraries it needs (once):
-   ```
-   pip install -r requirements.txt
-   ```
-
-Then, **every time you want to use it**:
+## Command-line use
 
 ```
-python app.py
-```
-
-You'll see a line like `Running on http://127.0.0.1:5000`. Open that address in
-your web browser, **drag in the four files** (P&ID PDF, Line List, Valve List,
-MEL), and click **Run consistency check**. You get the results on screen and a
-**Download Excel report** button. Press `Ctrl+C` in the terminal to stop it.
-
-## Prefer the command line?
-
-The same analysis is also a script. Order of files: PDF, Line List, Valve List,
-MEL, then the report name to create:
-
-```
+pip install -r requirements.txt
 python check_project.py PID.pdf Line_List.xlsx Valve_List.xlsx MEL.xlsx report.xlsx
 ```
-
-## What the report contains
-
-- **Summary** — counts of equipment / valves / lines found and total discrepancies.
-- **Discrepancies** — the items on a P&ID that are missing from a list (the point).
-- **Full PID Inventory** — every tag found, so you can confirm nothing was missed.
-
-## Adjusting it to other projects
-
-The tag formats are calibrated to the 2233 Kathleen Valley drawings. If your
-drawings use different conventions, the patterns live near the top of
-`check_project.py` (and `config.py`) and can be adjusted there.
 
 ## Tests
 
@@ -76,13 +49,14 @@ drawings use different conventions, the patterns live near the top of
 python tests/test_check_project.py
 ```
 
-Generates tiny synthetic files in the project's tag style and checks that the
-reconciliation flags exactly the planted "on-drawing-but-not-in-list" items.
+Generates tiny synthetic files in the project's tag style and checks the
+side-by-side tables, the twice-rule, description extraction and valve pairing.
 
-## Notes
+## Known limitations / in progress
 
-- P&IDs are read as native PDF text (fast, exact). Scanned/raster drawings would
-  need OCR (`tesseract`), which isn't required for native-text PDFs like these.
-- Valves are matched by their physical tag. Instrument/actuated valve loop tags
-  (`YV-`/`SV-` shown as instrument balloons) are out of scope for now.
-```
+- **Continuation-ribbon check** (verifying that a line's off-page connector
+  points to the right drawing) is not done yet — the connector geometry needs
+  more work and the full drawing set to validate.
+- **Description extraction** is best-effort; a small number of equipment that
+  sit in vendor-package blocks may read the wrong description.
+- Instrument/actuated valve loop tags (`YV-`/`SV-` balloons) are out of scope.
