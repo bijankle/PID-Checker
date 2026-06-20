@@ -156,17 +156,24 @@ async function sheetsRows(file, predicate){
 }
 const U=v=>String(v??"").trim().toUpperCase();
 const digits=v=>String(v).replace(/\D/g,"");
+const normKey=s=>String(s).toLowerCase().replace(/[\s_-]/g,"");
+function findKey(obj,...wanted){const w=wanted.map(normKey);for(const k in obj) if(w.includes(normKey(k))) return k;return null;}
 
 // ---------- build reference sets (mirrors load_references) ----------
 async function buildReferences(){
   const ref={equipment:new Set(),codes:new Set(),valves:new Set(),
-             servNum:new Set(),servSpecNum:new Set()};
+             servNum:new Set(),servSpecNum:new Set(),declaredPid:{}};
 
   if(store.mel){
     const rows=await rowsOf(store.mel.file,"Equipment List");
+    const eqKey=rows.length?(findKey(rows[0],"Equipment No.")||"Equipment No."):"Equipment No.";
+    const pidKey=rows.length?findKey(rows[0],"P&ID No.","PID No."):null;  // home drawing per MEL
     for(const r of rows){
-      const m=U(r["Equipment No."]).match(/^(\d{3})-([A-Z]{2})-(\d{3})$/);
-      if(m){ ref.equipment.add(m[0]); ref.codes.add(m[2]); }
+      const m=U(r[eqKey]).match(/^(\d{3})-([A-Z]{2})-(\d{3})$/);
+      if(m){
+        ref.equipment.add(m[0]); ref.codes.add(m[2]);
+        if(pidKey){ const dm=String(r[pidKey]).toUpperCase().match(/\b(\d{3}-FP-\d{3})\b/); if(dm) ref.declaredPid[m[0]]=dm[1]; }
+      }
     }
   }
   if(store.valve){
@@ -211,10 +218,17 @@ async function buildReferences(){
 // ---------- read PDF text per page ----------
 async function pdfPages(file){
   const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+  const RE_FP=/^\d{3}-FP-\d{3}$/;
   const pages=[];
   for(let i=1;i<=pdf.numPages;i++){
     const tc=await (await pdf.getPage(i)).getTextContent();
-    pages.push(tc.items.map(it=>it.str).join("\n"));
+    const text=tc.items.map(it=>it.str).join("\n");
+    // the sheet's own number = the FP word nearest the bottom (title block),
+    // tie-broken to the right. pdf.js y grows upward, so smallest y = bottom.
+    const fps=tc.items.filter(it=>RE_FP.test(it.str.trim()))
+                      .map(it=>({t:it.str.trim(),x:it.transform[4],y:it.transform[5]}));
+    fps.sort((a,b)=>a.y-b.y||b.x-a.x);
+    pages.push({text, dwg: fps.length?fps[0].t:null});
   }
   return pages;
 }
@@ -256,12 +270,17 @@ async function run(){
 
     const rows=[];
     const sortedAdd=(set,fn)=>[...set].sort().forEach(fn);
-    pages.forEach(text=>{
-      const dwgM=text.toUpperCase().match(RE_DWG);
-      const dwg=dwgM?dwgM[1]:"(unknown drawing)";
-      const f=extractPage(text,ref.codes);
+    pages.forEach(p=>{
+      const dwg=p.dwg||"(unknown drawing)";
+      const f=extractPage(p.text,ref.codes);
       if(store.mel){
-        sortedAdd(f.eq,t=>rows.push([dwg,"Equipment",t,"MEL",ref.equipment.has(t)?"IN LIST":"NOT IN MEL"]));
+        sortedAdd(f.eq,t=>{
+          let status;
+          if(!ref.equipment.has(t)) status="NOT IN MEL";
+          else if(ref.declaredPid[t] && ref.declaredPid[t]!==dwg) status="P&ID MISMATCH (MEL says "+ref.declaredPid[t]+")";
+          else status="IN LIST";
+          rows.push([dwg,"Equipment",t,"MEL",status]);
+        });
         sortedAdd(f.other,t=>rows.push([dwg,"Other",t,"MEL","NOT IN MEL (untracked type)"]));
       }
       if(store.valve)

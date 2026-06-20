@@ -14,6 +14,11 @@ Scope decisions (per project owner):
     loop tags are out of scope for now).
   * ANY tagged item on a P&ID that is not in the relevant list is a discrepancy,
     including CCTV cameras (CA) and stockpiles (SP) absent from the MEL.
+  * The drawing number is read from the title block by position (the FP word
+    nearest the bottom of the sheet), so cross-references to other drawings on
+    the same sheet do not get mistaken for the sheet's own number.
+  * For equipment, the drawing it is found on is compared against the MEL's
+    "P&ID No." column; a mismatch is flagged ("P&ID MISMATCH").
 
 Run:  python check_project.py PID.pdf Line_List.xlsx Valve_List.xlsx MEL.xlsx [out.xlsx]
 """
@@ -31,21 +36,51 @@ RE_VV   = re.compile(r"\b(\d{3})-VV-(\d{3})\b")
 RE_VSZ  = re.compile(r"\b(\d{2,4})V(\d{2})([A-Z])\b")
 RE_LINE = re.compile(r"\b(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})\b")
 RE_DWG  = re.compile(r"\b(\d{3}-FP-\d{3})\b")
+RE_FP_FULL = re.compile(r"^\d{3}-FP-\d{3}$")  # a whole word that is a drawing no.
 
 # Codes that are NOT mechanical equipment even though they fit AREA-XX-NNN.
 NON_EQUIPMENT_CODES = {"FP"}  # drawing references; VV handled separately
 
 
+def _find_col(columns, *wanted):
+    """Find a column by fuzzy, whitespace/case-insensitive match."""
+    norm = lambda s: "".join(str(s).lower().split()).replace("_", "").replace("-", "")
+    targets = [norm(w) for w in wanted]
+    for c in columns:
+        if norm(c) in targets:
+            return c
+    return None
+
+
+def drawing_number(page):
+    """The sheet's own drawing number = the NNN-FP-NNN word nearest the bottom
+    of the page (the title block), tie-broken to the right. This ignores the
+    many cross-references to other drawings elsewhere on the sheet."""
+    fps = [w for w in page.get_text("words") if RE_FP_FULL.match(w[4])]
+    if not fps:
+        return None
+    # words are (x0, y0, x1, y1, text, ...). Largest y0 = lowest on page.
+    fps.sort(key=lambda w: (w[1], w[0]))
+    return fps[-1][4]
+
+
 def load_references(line_path, valve_path, mel_path):
     """Build the identifier sets each P&ID tag is checked against."""
-    # MEL equipment + the set of valid equipment type codes.
+    # MEL equipment + the set of valid equipment type codes + declared P&ID.
     mel = pd.read_excel(mel_path, sheet_name="Equipment List", header=0, dtype=str)
-    equipment, codes = set(), set()
-    for v in mel["Equipment No."].dropna():
-        m = RE_EQ.fullmatch(str(v).strip().upper())
-        if m:
-            equipment.add(m.group(0))
-            codes.add(m.group(2))
+    equipment, codes, declared_pid = set(), set(), {}
+    eq_col = _find_col(mel.columns, "Equipment No.") or "Equipment No."
+    pid_col = _find_col(mel.columns, "P&ID No.", "P&ID\nNo.", "PID No.")
+    for _, row in mel.iterrows():
+        m = RE_EQ.fullmatch(str(row.get(eq_col)).strip().upper())
+        if not m:
+            continue
+        equipment.add(m.group(0))
+        codes.add(m.group(2))
+        if pid_col is not None:
+            dm = RE_DWG.search(str(row.get(pid_col)).upper())
+            if dm:
+                declared_pid[m.group(0)] = dm.group(1)
 
     # Valve identifiers: union of every identifier-bearing column / sheet.
     valves = set()
@@ -85,7 +120,8 @@ def load_references(line_path, valve_path, mel_path):
                 serv_spec_num.add((m.group(2), m.group(3), str(int(m.group(4)))))
 
     return {"equipment": equipment, "codes": codes, "valves": valves,
-            "serv_num": serv_num, "serv_spec_num": serv_spec_num}
+            "serv_num": serv_num, "serv_spec_num": serv_spec_num,
+            "declared_pid": declared_pid}
 
 
 def extract_page(text, codes):
@@ -122,17 +158,22 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
     it and present the results however they like.
     """
     ref = load_references(line_path, valve_path, mel_path)
+    declared = ref["declared_pid"]
     rows = []
     with fitz.open(pdf_path) as doc:
         for page in doc:
             text = page.get_text("text")
-            m = RE_DWG.search(text)
-            dwg = m.group(1) if m else f"(page {page.number + 1})"
+            dwg = drawing_number(page) or f"(page {page.number + 1})"
             found = extract_page(text, ref["codes"])
             for tag in sorted(found["Equipment"]):
-                ok = tag in ref["equipment"]
-                rows.append([dwg, "Equipment", tag, "MEL",
-                             "IN LIST" if ok else "NOT IN MEL"])
+                if tag not in ref["equipment"]:
+                    status = "NOT IN MEL"
+                elif tag in declared and declared[tag] != dwg:
+                    # in the MEL, but drawn on a sheet other than its declared P&ID
+                    status = f"P&ID MISMATCH (MEL says {declared[tag]})"
+                else:
+                    status = "IN LIST"
+                rows.append([dwg, "Equipment", tag, "MEL", status])
             for tag in sorted(found["Valve"]):
                 ok = tag in ref["valves"]
                 rows.append([dwg, "Valve", tag, "Valve List",
