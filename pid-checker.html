@@ -120,7 +120,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/p
 const RE_EQ=/\b(\d{3})-([A-Z]{2})-(\d{3})\b/g, RE_VSZ=/\b(\d{2,4})V(\d{2})([A-Z])\b/g,
       RE_LINE=/\b(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})\b/g;
 const EQF=/^(\d{3})-([A-Z]{2})-(\d{3})$/, VSZF=/^\d{2,4}V\d{2}[A-Z]$/, VVF=/^\d{3}-VV-\d{3}$/,
-      FPF=/^\d{3}-FP-\d{3}$/, DWGg=/\b(\d{3}-FP-\d{3})\b/g;
+      FPF=/^\d{3}-FP-\d{3}$/, DWGg=/\b(\d{3}-FP-\d{3})\b/g, LNF=/^\d{2,4}-[A-Z]{2,3}-[A-Z]\d{2}-\d{3}$/;
 const ONLY_ONCE="Only labelled once — verify (possible cross-reference)";
 
 const U=v=>String(v??"").trim().toUpperCase(), dg=v=>String(v).replace(/\D/g,"");
@@ -219,9 +219,11 @@ async function pdfPages(file){
     const items=tc.items.map(it=>({str:it.str,x:it.transform[4],y:it.transform[5],
       cx:it.transform[4]+(it.width||0)/2, cy:it.transform[5]+(it.height||0)/2}));
     const text=items.map(it=>it.str).join("\n");
-    const fps=items.filter(it=>FPF.test(it.str.trim())).map(it=>({t:it.str.trim(),x:it.x,y:it.y}));
-    fps.sort((a,b)=>a.y-b.y||b.x-a.x);
-    out.push({dwg:fps.length?fps[0].t:"(unknown)",H,W,items,text});
+    const fps=items.filter(it=>FPF.test(it.str.trim()));
+    const corner=fps.filter(it=>it.x>0.6*W&&it.y<0.15*H);   // bottom-right title block (y is bottom-origin)
+    const pool=corner.length?corner:fps;
+    pool.sort((a,b)=>a.y-b.y||b.x-a.x);
+    out.push({dwg:pool.length?pool[0].str.trim():"(unknown)",H,W,items,text});
   }
   return out;
 }
@@ -246,6 +248,17 @@ function valvePairs(items,W){
     if(best&&bd<0.05*W)out[it.str.trim()]=best;}
   return out;
 }
+function continuationRibbons(items,W,H){
+  // border off-page connector: target drawing in the flag, line number same row inboard
+  const fps=items.filter(it=>FPF.test(it.str.trim())), lns=items.filter(it=>LNF.test(it.str.trim()));
+  const out=[];
+  for(const w of fps){const xf=w.x/W, yftop=(H-w.y)/H;
+    if(yftop>=0.88||(0.12<xf&&xf<0.88))continue;
+    let best=null,bd=1e9;
+    for(const l of lns){if(Math.abs(l.y-w.y)>=0.015*H)continue;const d=Math.abs(l.x-w.x);if(d<bd){bd=d;best=l;}}
+    if(best&&bd/W<0.15)out.push([w.str.trim(),best.str.trim()]);}
+  return out;
+}
 function pageTags(text,codes){
   const T=text.toUpperCase();
   const lines=new Set([...T.matchAll(RE_LINE)].map(m=>m[0]));
@@ -262,6 +275,7 @@ async function analyze(){
   const homes={};
   for(const pg of pages){Object.assign(pg, pageTags(pg.text,ref.codes));
     pg.desc=store.mel?descriptions(pg.items,pg.H):{}; pg.vp=valvePairs(pg.items,pg.W);
+    pg.ribbons=continuationRibbons(pg.items,pg.W,pg.H);
     for(const o of [pg.eq,pg.oth])for(const t in o)if(o[t]>=2)(homes[t]=homes[t]||new Set()).add(pg.dwg);}
 
   const EQc=["P&ID","PID Equip No","MEL Equip No","PID Description","MEL Description","Notes"];
@@ -304,7 +318,20 @@ async function analyze(){
       ln.rows.push([[...g.tags].sort().join(" / "),listNo,pp.join(", "),lp.join(", "),note]);
       ln.mask.push([0,!matched,bad,bad,!!note]);}
   }
-  const tables={Equipment:eq,Valves:vl,Lines:ln,Other:ot};
+  // Continuations: verify each border ribbon's target drawing carries the line
+  const linesOn={}, allDwgs=new Set();
+  for(const pg of pages){allDwgs.add(pg.dwg);const s=linesOn[pg.dwg]=linesOn[pg.dwg]||new Set();
+    for(const tag of pg.lines){const m=tag.match(/(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})/);s.add(m[2]+"|"+String(parseInt(m[4],10)));}}
+  const ct={cols:["On Sheet","Ribbon → Drawing","Line No","Status"],rows:[],mask:[]};
+  for(const pg of pages)for(const [tgt,lt] of (pg.ribbons||[])){
+    const m=lt.match(/(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})/);const k=m[2]+"|"+String(parseInt(m[4],10));
+    let status,bad;
+    if(!allDwgs.has(tgt)){status="target drawing not in this set";bad=false;}
+    else if(linesOn[tgt]&&linesOn[tgt].has(k)){status="OK";bad=false;}
+    else{status="LINE NOT FOUND ON TARGET DRAWING";bad=true;}
+    ct.rows.push([pg.dwg,tgt,lt,status]);ct.mask.push([0,bad,bad,bad]);}
+
+  const tables={Equipment:eq,Valves:vl,Lines:ln,Continuations:ct,Other:ot};
   const review=Object.values(tables).reduce((n,t)=>n+t.mask.filter(m=>m.some(Boolean)).length,0);
   const summary=[["P&ID pages",new Set(pages.map(p=>p.dwg)).size],["Equipment found",eq.rows.length],
     ["Valves found",vl.rows.length],["Lines found",ln.rows.length],["Other tagged items",ot.rows.length],
@@ -331,6 +358,7 @@ const SEC={
   Equipment:{title:"Equipment",sub:"PID equipment no. vs MEL — and PID description vs MEL description."},
   Valves:{title:"Valves",sub:"Unique VV tag and its sized code, drawing vs valve list."},
   Lines:{title:"Lines",sub:"Grouped by service + sequential (reducers / spec breaks are one line). Drawing P&IDs vs line-list P&ID."},
+  Continuations:{title:"Continuations",sub:"Each off-page ribbon's target drawing is checked to actually carry that line."},
   Other:{title:"Other tags (not in the MEL)",sub:"Cameras, stockpiles and similar items tagged on a drawing but not tracked in the MEL."},
 };
 function render(res){
@@ -342,7 +370,7 @@ function render(res){
   </div>
   <p class="legend"><span class="chip"></span>Highlighted cells disagree between the drawing and the list.</p>`;
 
-  for(const name of ["Equipment","Valves","Lines","Other"]){
+  for(const name of ["Equipment","Valves","Lines","Continuations","Other"]){
     const t=res.tables[name]; if(!t.rows.length) continue;
     html+=`<h2 class="sec">${SEC[name].title} <span style="color:var(--muted);font-weight:600;font-size:14px;">· ${t.rows.length}</span></h2>`;
     html+=`<p class="sec-sub">${SEC[name].sub}</p>`;
@@ -370,7 +398,7 @@ async function downloadExcel(){
   const red={type:"pattern",pattern:"solid",fgColor:{argb:"FFFCEDED"}};
   const sw=wb.addWorksheet("Summary"); sw.addRow(["Metric","Value"]); sw.getRow(1).font={bold:true};
   RESULT.summary.forEach(r=>sw.addRow(r));
-  for(const name of ["Equipment","Valves","Lines","Other"]){
+  for(const name of ["Equipment","Valves","Lines","Continuations","Other"]){
     const t=RESULT.tables[name]; const ws=wb.addWorksheet(name);
     ws.addRow(t.cols); ws.getRow(1).font={bold:true};
     t.rows.forEach((row,ri)=>{const xr=ws.addRow(row);
