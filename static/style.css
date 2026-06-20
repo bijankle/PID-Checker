@@ -1,0 +1,35 @@
+:root { --error:#c0392b; --warn:#b9770e; --info:#2471a3; --ok:#1e8449; }
+* { box-sizing: border-box; }
+body { font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  margin: 0; background: #f4f6f8; color: #1d2733; }
+.container { max-width: 720px; margin: 2rem auto; background: #fff; padding: 2rem;
+  border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.container.wide { max-width: 1100px; }
+h1 { margin-top: 0; }
+.lead { color: #51606f; }
+fieldset { border: 1px solid #dde3e8; border-radius: 8px; margin: 1rem 0; padding: 1rem; }
+legend { font-weight: 600; padding: 0 .4rem; }
+label { display: block; margin: .6rem 0; }
+input[type=file] { display: block; margin-top: .25rem; }
+button { background: #2471a3; color: #fff; border: 0; padding: .7rem 1.4rem;
+  font-size: 1rem; border-radius: 6px; cursor: pointer; }
+button:hover { background: #1b5a82; }
+.flash { background: #fdecea; border: 1px solid #f5c6cb; color: var(--error);
+  padding: .6rem 1rem; border-radius: 6px; list-style: none; }
+.summary { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin: 1rem 0; }
+.badge { padding: .3rem .7rem; border-radius: 20px; color: #fff; font-weight: 600; }
+.badge.error { background: var(--error); }
+.badge.warning { background: var(--warn); }
+.badge.info { background: var(--info); }
+.download { margin-left: auto; background: var(--ok); color: #fff;
+  padding: .5rem 1rem; border-radius: 6px; text-decoration: none; }
+.secondary { color: #2471a3; text-decoration: none; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 14px; }
+th, td { border: 1px solid #e1e6ea; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+th { background: #f0f3f6; }
+.findings tr.sev-error td:first-child { color: var(--error); font-weight: 600; }
+.findings tr.sev-warning td:first-child { color: var(--warn); font-weight: 600; }
+.findings tr.sev-info td:first-child { color: var(--info); font-weight: 600; }
+.context { margin: 1rem 0; }
+.context summary { cursor: pointer; font-weight: 600; }
+.ok { color: var(--ok); font-size: 1.1rem; }
