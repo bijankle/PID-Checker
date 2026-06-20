@@ -155,6 +155,29 @@ def valve_pairs(page):
     return out
 
 
+def continuation_ribbons(page):
+    """Off-page connectors sit at the left/right border: the target drawing
+    number in the flag, with the line number on the same row just inboard.
+    Returns a list of (target_drawing, line_tag) for this sheet."""
+    W, H = page.rect.width, page.rect.height
+    ws = page.get_text("words")
+    fps = [w for w in ws if RE_FP_FULL.match(w[4])]
+    lns = [w for w in ws if RE_LINE.fullmatch(w[4])]
+    out = []
+    for w in fps:
+        xf, yf = w[0] / W, w[1] / H
+        if yf >= 0.88 or (0.12 < xf < 0.88):
+            continue                       # title block, or not a border connector
+        fx, fy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+        cands = [l for l in lns if abs((l[1] + l[3]) / 2 - fy) < 0.015 * H]  # same row
+        if not cands:
+            continue
+        best = min(cands, key=lambda l: abs((l[0] + l[2]) / 2 - fx))
+        if abs((best[0] + best[2]) / 2 - fx) / W < 0.15:
+            out.append((w[4], best[4]))
+    return out
+
+
 # --------------------------------------------------------------------------
 # reference data from the lists
 # --------------------------------------------------------------------------
@@ -284,6 +307,7 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
                 "eq": eq_counts, "other": other_counts,
                 "desc": equipment_descriptions(page),
                 "vpairs": valve_pairs(page),
+                "ribbons": continuation_ribbons(page),
             })
             for tag, c in (eq_counts | other_counts).items():
                 if c >= 2:
@@ -359,29 +383,55 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
                         ", ".join(pid_pids), ", ".join(list_pids), note])
         ln_mask.append([False, not matched, pids_bad, pids_bad, bool(note)])
 
+    # Continuations: verify each off-page ribbon points to a drawing that
+    # actually carries that line (by service + sequential).
+    all_dwgs = {pg["dwg"] for pg in pages}
+    lines_on = {}
+    for pg in pages:
+        s = lines_on.setdefault(pg["dwg"], set())
+        for tag in pg["lines"]:
+            s.add(line_key(tag))
+    ct_rows, ct_mask = [], []
+    for pg in pages:
+        for tgt, ltag in pg["ribbons"]:
+            key = line_key(ltag)
+            if tgt not in all_dwgs:
+                status, bad = "target drawing not in this set", False
+            elif key in lines_on.get(tgt, set()):
+                status, bad = "OK", False
+            else:
+                status, bad = "LINE NOT FOUND ON TARGET DRAWING", True
+            ct_rows.append([pg["dwg"], tgt, ltag, status])
+            ct_mask.append([False, bad, bad, bad])
+
     eq_cols = ["P&ID", "PID Equip No", "MEL Equip No", "PID Description", "MEL Description", "Notes"]
     vl_cols = ["P&ID", "PID Valve Tag", "List Valve Tag", "PID Size Code", "List Size Code", "Notes"]
     ln_cols = ["PID Line No", "List Line No", "PID P&IDs", "List P&ID", "Notes"]
     ot_cols = ["P&ID", "Tag", "Status", "Notes"]
+    ct_cols = ["On Sheet", "Ribbon → Drawing", "Line No", "Status"]
 
     tables = {
         "Equipment": pd.DataFrame(eq_rows, columns=eq_cols),
         "Valves":    pd.DataFrame(vl_rows, columns=vl_cols),
         "Lines":     pd.DataFrame(ln_rows, columns=ln_cols),
+        "Continuations": pd.DataFrame(ct_rows, columns=ct_cols),
         "Other":     pd.DataFrame(ot_rows, columns=ot_cols),
     }
     masks = {
         "Equipment": pd.DataFrame(eq_mask, columns=eq_cols),
         "Valves":    pd.DataFrame(vl_mask, columns=vl_cols),
         "Lines":     pd.DataFrame(ln_mask, columns=ln_cols),
+        "Continuations": pd.DataFrame(ct_mask, columns=ct_cols),
         "Other":     pd.DataFrame([[False] * len(ot_cols) for _ in ot_rows], columns=ot_cols),
     }
     flagged = sum(int(m.any(axis=1).sum()) for m in masks.values()) + len(ot_rows)
     summary = pd.DataFrame({
         "Metric": ["P&ID pages", "Equipment found", "Valves found", "Lines found",
+                   "Continuations checked", "Bad continuations",
                    "Other tagged items", "Rows needing review"],
         "Value": [len({p["dwg"] for p in pages}), len(eq_rows), len(vl_rows),
-                  len(ln_rows), len(ot_rows), flagged],
+                  len(ln_rows), len(ct_rows), int((pd.DataFrame(ct_mask).any(axis=1)).sum()) if ct_mask else 0,
+                  len(ot_rows), flagged],
     })
     return {"tables": tables, "masks": masks, "summary": summary}
 
@@ -392,7 +442,7 @@ def write_report(result, out_path):
     red = PatternFill("solid", fgColor="FFC7CE")
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         result["summary"].to_excel(xw, sheet_name="Summary", index=False)
-        for name in ("Equipment", "Valves", "Lines", "Other"):
+        for name in ("Equipment", "Valves", "Lines", "Continuations", "Other"):
             df = result["tables"][name]
             df.to_excel(xw, sheet_name=name, index=False)
             mask = result["masks"][name]
