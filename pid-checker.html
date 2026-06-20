@@ -81,6 +81,26 @@ td.bad{background:var(--red-bg);color:var(--red-tx);font-weight:600;}
 details>summary{cursor:pointer;font-weight:600;color:var(--sub2);margin:10px 0;}
 .legend{font-size:12.5px;color:var(--muted);margin:6px 0 0;}
 .legend .chip{display:inline-block;width:12px;height:12px;border-radius:3px;background:var(--red-bg);border:1px solid var(--red-bd);vertical-align:-2px;margin-right:5px;}
+.badge.muted{background:var(--hover);color:var(--muted);}
+.tabbar{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 14px;}
+.tab{appearance:none;display:inline-flex;align-items:center;gap:7px;border:1px solid var(--border);background:#fff;color:var(--sub2);font:600 13px var(--font);padding:7px 13px;border-radius:999px;cursor:pointer;transition:.12s;}
+.tab:hover{background:var(--hover);}
+.tab.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+.tab .tcount{background:var(--hover);color:var(--sub2);border-radius:999px;padding:1px 7px;font-size:12px;font-weight:700;}
+.tab.active .tcount{background:rgba(255,255,255,.22);color:#fff;}
+.tab .tflag{color:var(--red);font-weight:800;font-size:12px;}
+.tab.active .tflag{color:#fff;}
+.tabhead{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding:14px 16px;border-bottom:1px solid #EEF0F2;}
+.tabdesc{color:var(--muted);font-size:13px;line-height:1.5;max-width:74ch;}
+.tabactions{display:flex;flex-direction:column;gap:8px;flex:none;}
+.btn2{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 14px;border:1px solid var(--border-in);border-radius:8px;background:#fff;color:var(--sub2);font:600 13px var(--font);cursor:pointer;transition:.12s;white-space:nowrap;}
+.btn2:hover{background:var(--hover);}
+.btn2.primary2{background:var(--accent);border-color:var(--accent);color:#fff;}
+.btn2.primary2:hover{background:var(--accent-deep);}
+.tabtools{display:flex;align-items:center;gap:18px;padding:11px 16px;border-bottom:1px solid #EEF0F2;flex-wrap:wrap;}
+.toggle{display:inline-flex;align-items:center;gap:8px;font-size:14px;font-weight:600;color:var(--text);cursor:pointer;}
+.toggle input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer;}
+#tabtable .scroll{max-height:540px;}
 </style>
 </head>
 <body>
@@ -345,7 +365,6 @@ async function analyze(){
 }
 
 // ---------- run + render ----------
-let RESULT=null;
 runBtn.addEventListener("click",run);
 async function run(){
   runBtn.disabled=true; resultsEl.innerHTML="";
@@ -360,57 +379,138 @@ async function run(){
 function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 
 const SEC={
-  Equipment:{title:"Equipment",sub:"PID equipment no. vs MEL — and PID description vs MEL description."},
-  Valves:{title:"Valves",sub:"Unique VV tag and its sized code, drawing vs valve list."},
-  Lines:{title:"Lines",sub:"Grouped by service + sequential (reducers / spec breaks are one line). Drawing P&IDs vs line-list P&ID."},
-  Continuations:{title:"Continuations",sub:"Off-page ribbon line (from) vs the line found on the named target drawing (to). Flagged when the named P&ID doesn't carry that exact line."},
-  Other:{title:"Other tags (not in the MEL)",sub:"Cameras, stockpiles and similar items tagged on a drawing but not tracked in the MEL."},
-  "Manual Review":{title:"Manual review",sub:"Sheets with no readable text (scanned, or text saved as outlines) — check these P&IDs by hand."},
+  Equipment:{title:"MEL",sub:"Equipment — PID equipment no. vs MEL, and PID description vs MEL description."},
+  Valves:{title:"Valve",sub:"Valves — unique VV tag and its sized code, drawing vs valve list."},
+  Lines:{title:"Line",sub:"Lines — grouped by service + sequential (reducers / spec breaks are one line). Drawing P&IDs vs line-list P&ID."},
+  Continuations:{title:"Cont",sub:"Continuations — off-page ribbon line (from) vs the line on the named target drawing (to). Flagged when the named P&ID doesn't carry that exact line."},
+  Other:{title:"Other",sub:"Other tags — cameras, stockpiles and similar items tagged on a drawing but not tracked in the MEL."},
+  "Manual Review":{title:"Verify",sub:"Manual review — sheets with no readable text (scanned, or text saved as outlines). Check these P&IDs by hand."},
 };
-function render(res){
-  const r=res.review;
-  let html=`<div class="summary">
-    <span class="badge ${r?'review':'ok'} dot">${r} to review</span>
-    ${res.summary.slice(0,5).map(([m,v])=>`<span class="badge info">${esc(String(v))} ${esc(m.replace(' found','').replace('P&ID ','').toLowerCase())}</span>`).join("")}
-    <button class="primary dl" id="dl">Download Excel report</button>
-  </div>
-  <p class="legend"><span class="chip"></span>Highlighted cells disagree between the drawing and the list.</p>`;
+let RESULT=null, CURRENT_TAB=null, ONLY_FLAG=false;
+const rowFlagged=(t,ri)=>!!(t.mask[ri]&&t.mask[ri].some(Boolean));
+const flagCount=t=>t.rows.reduce((n,_,ri)=>n+(rowFlagged(t,ri)?1:0),0);
+const TAB_ORDER=["Equipment","Valves","Lines","Continuations","Other","Manual Review"];
 
-  for(const name of ["Equipment","Valves","Lines","Continuations","Other","Manual Review"]){
-    const t=res.tables[name]; if(!t.rows.length) continue;
-    html+=`<h2 class="sec">${SEC[name].title} <span style="color:var(--muted);font-weight:600;font-size:14px;">· ${t.rows.length}</span></h2>`;
-    html+=`<p class="sec-sub">${SEC[name].sub}</p>`;
-    html+=`<div class="tablewrap"><div class="scroll">${tableHtml(t)}</div></div>`;
-  }
+function render(res){
+  RESULT=res;
+  const names=TAB_ORDER.filter(n=>res.tables[n]&&res.tables[n].rows.length);
+  if(!names.includes(CURRENT_TAB)) CURRENT_TAB=names[0];
+  const r=res.review;
+  const pages=(res.summary.find(([m])=>/pages$/.test(m))||[,0])[1];
+  // The summary IS the tab strip: one clickable chip per section, same breakdown.
+  const chips=names.map(n=>{const t=res.tables[n],f=flagCount(t);
+    return `<button class="tab" data-tab="${esc(n)}">${esc(SEC[n].title)}`
+      +`<span class="tcount">${t.rows.length}</span>${f?`<span class="tflag">${f}⚑</span>`:''}</button>`;}).join("");
+  let html=`<div class="summary">
+      <span class="badge ${r?'review':'ok'} dot">${r} to review</span>
+      <span class="badge muted">${pages} sheets</span>
+    </div>
+    <div class="tabbar">${chips}</div>
+    <div class="panel" style="padding:0;overflow:hidden;">
+      <div class="tabhead">
+        <div class="tabdesc" id="tabsub"></div>
+        <div class="tabactions">
+          <button class="btn2" id="copyBtn">${ICON_COPY} Copy</button>
+          <button class="btn2 primary2" id="dl">${ICON_DL} Export Excel</button>
+        </div>
+      </div>
+      <div class="tabtools">
+        <label class="toggle"><input type="checkbox" id="onlyFlag"${ONLY_FLAG?" checked":""}> Show only flagged rows</label>
+        <span class="legend"><span class="chip"></span>Highlighted cells disagree between drawing and list</span>
+      </div>
+      <div id="tabtable"></div>
+    </div>`;
   resultsEl.innerHTML=html;
   document.getElementById("dl").addEventListener("click",downloadExcel);
+  document.getElementById("copyBtn").addEventListener("click",copyAll);
+  document.getElementById("onlyFlag").addEventListener("change",e=>{ONLY_FLAG=e.target.checked;paintTab();});
+  [...resultsEl.querySelectorAll(".tab")].forEach(b=>b.addEventListener("click",()=>{CURRENT_TAB=b.dataset.tab;paintTab();}));
+  paintTab();
 }
-function tableHtml(t){
+function paintTab(){
+  const t=RESULT.tables[CURRENT_TAB];
+  [...resultsEl.querySelectorAll(".tab")].forEach(b=>b.classList.toggle("active",b.dataset.tab===CURRENT_TAB));
+  document.getElementById("tabsub").textContent=SEC[CURRENT_TAB].sub;
+  const idx=t.rows.map((_,i)=>i).filter(i=>!ONLY_FLAG||rowFlagged(t,i));
+  document.getElementById("tabtable").innerHTML=`<div class="scroll">${tableHtml(t,idx)}</div>`;
+}
+const ICON_COPY='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const ICON_DL='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+function tableHtml(t,idx){
   const tagCols=new Set(["PID Equip No","MEL Equip No","PID Valve Tag","List Valve Tag",
     "PID Size Code","List Size Code","PID Line No","List Line No","PID P&IDs","List P&ID","P&ID","Tag",
     "Line No (from)","Line No (to)","P&ID (from)","P&ID (to)","Sheet","Ribbon → Drawing"]);
   let h="<table><thead><tr>"+t.cols.map(c=>`<th>${esc(c)}</th>`).join("")+"</tr></thead><tbody>";
-  t.rows.forEach((row,ri)=>{
+  if(!idx.length) h+=`<tr><td colspan="${t.cols.length}" class="note" style="padding:16px;">No flagged rows in this tab. 🎉</td></tr>`;
+  for(const ri of idx){const row=t.rows[ri];
     h+="<tr>"+row.map((c,ci)=>{
       const cls=[]; if(t.mask[ri]&&t.mask[ri][ci])cls.push("bad");
       if(t.cols[ci]==="Notes")cls.push("note"); else if(tagCols.has(t.cols[ci]))cls.push("tag");
       return `<td class="${cls.join(' ')}">${esc(c)}</td>`;
-    }).join("")+"</tr>";
-  });
+    }).join("")+"</tr>";}
   return h+"</tbody></table>";
 }
+// ---- Copy all tabs into one clipboard table, side by side ----
+function copyAll(){
+  if(!RESULT) return;
+  const names=TAB_ORDER.filter(n=>RESULT.tables[n]&&RESULT.tables[n].rows.length);
+  const HD='background:#5865F2;color:#ffffff;font-weight:700;padding:5px 9px;border:1px solid #E3E5E8;';
+  const COL='background:#F2F3F5;color:#4E5058;font-weight:700;padding:5px 9px;border:1px solid #E3E5E8;';
+  const CELL='padding:4px 9px;border:1px solid #E3E5E8;';
+  const BAD='background:#FCEDED;color:#A82C2E;font-weight:700;';
+  const SP='border:none;width:24px;';     // narrow empty spacer column
+  let h='<table style="border-collapse:collapse;font:13px Aptos,Segoe UI,sans-serif;color:#2E3035;">';
+  // section-title row
+  h+='<tr>'+names.map((n,si)=>`<td colspan="${RESULT.tables[n].cols.length}" style="${HD}">${esc(SEC[n].title)}</td>`
+        +(si<names.length-1?`<td style="${SP}"></td>`:'')).join('')+'</tr>';
+  // column-header row
+  h+='<tr>'+names.map((n,si)=>RESULT.tables[n].cols.map(c=>`<td style="${COL}">${esc(c)}</td>`).join('')
+        +(si<names.length-1?`<td style="${SP}"></td>`:'')).join('')+'</tr>';
+  // data rows
+  const maxR=Math.max(...names.map(n=>RESULT.tables[n].rows.length));
+  for(let r=0;r<maxR;r++){
+    h+='<tr>'+names.map((n,si)=>{
+      const t=RESULT.tables[n]; let cells;
+      if(r<t.rows.length) cells=t.rows[r].map((c,ci)=>`<td style="${CELL}${(t.mask[r]&&t.mask[r][ci])?BAD:''}">${esc(c)}</td>`).join('');
+      else cells=t.cols.map(()=>`<td style="${CELL}"></td>`).join('');
+      return cells+(si<names.length-1?`<td style="${SP}"></td>`:'');
+    }).join('')+'</tr>';
+  }
+  h+='</table>';
+  // rich copy via a temporary selection (works from a double-clicked file://)
+  const div=document.createElement('div');
+  div.style.cssText='position:fixed;left:-99999px;top:0;'; div.innerHTML=h;
+  document.body.appendChild(div);
+  const range=document.createRange(); range.selectNode(div);
+  const sel=window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  let ok=false; try{ ok=document.execCommand('copy'); }catch(e){}
+  sel.removeAllRanges(); document.body.removeChild(div);
+  const btn=document.getElementById('copyBtn');
+  if(btn){ const orig=btn.innerHTML; btn.innerHTML=ok?'✓ Copied':'Copy failed';
+    setTimeout(()=>{btn.innerHTML=orig;},1500); }
+}
+
+// ---- Export a Blurprint-themed Excel workbook ----
 async function downloadExcel(){
   if(!RESULT) return;
   const wb=new ExcelJS.Workbook();
-  const red={type:"pattern",pattern:"solid",fgColor:{argb:"FFFCEDED"}};
-  const sw=wb.addWorksheet("Summary"); sw.addRow(["Metric","Value"]); sw.getRow(1).font={bold:true};
-  RESULT.summary.forEach(r=>sw.addRow(r));
-  for(const name of ["Equipment","Valves","Lines","Continuations","Other","Manual Review"]){
-    const t=RESULT.tables[name]; const ws=wb.addWorksheet(name);
-    ws.addRow(t.cols); ws.getRow(1).font={bold:true};
+  const HEAD={fill:{type:"pattern",pattern:"solid",fgColor:{argb:"FF5865F2"}},
+              font:{bold:true,color:{argb:"FFFFFFFF"}}};
+  const RED={fill:{type:"pattern",pattern:"solid",fgColor:{argb:"FFFCEDED"}},
+             font:{color:{argb:"FFA82C2E"},bold:true}};
+  const thin={style:"thin",color:{argb:"FFE3E5E8"}};
+  const border={top:thin,left:thin,bottom:thin,right:thin};
+  const sheets=[["Summary",{cols:["Metric","Value"],rows:RESULT.summary,mask:[]}]]
+    .concat(TAB_ORDER.map(n=>[n,RESULT.tables[n]]));
+  for(const [name,t] of sheets){
+    const ws=wb.addWorksheet(name);
+    const hr=ws.addRow(t.cols);
+    hr.eachCell(c=>{c.fill=HEAD.fill;c.font=HEAD.font;c.border=border;});
     t.rows.forEach((row,ri)=>{const xr=ws.addRow(row);
-      (t.mask[ri]||[]).forEach((bad,ci)=>{if(bad)xr.getCell(ci+1).fill=red;});});
-    ws.columns.forEach(col=>{let w=12;col.eachCell({includeEmpty:true},c=>{w=Math.max(w,String(c.value??"").length+2);});col.width=Math.min(w,48);});
+      xr.eachCell({includeEmpty:true},(c,ci)=>{c.border=border;
+        if(t.mask[ri]&&t.mask[ri][ci-1]){c.fill=RED.fill;c.font=RED.font;}});});
+    ws.views=[{state:"frozen",ySplit:1}];
+    ws.columns.forEach(col=>{let w=12;col.eachCell({includeEmpty:true},c=>{w=Math.max(w,String(c.value??"").length+2);});col.width=Math.min(w,52);});
   }
   const buf=await wb.xlsx.writeBuffer();
   const a=document.createElement("a");
