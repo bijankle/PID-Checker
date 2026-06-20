@@ -13,7 +13,18 @@ It reads every tag off the P&ID PDF and reconciles:
 Anything tagged on a drawing whose type isn't tracked (e.g. CCTV cameras `CA`)
 is also reported as a discrepancy.
 
-## How to run the web app (the easy way)
+## Easiest: the single-file version (no install)
+
+Open **`pid-checker.html`** by double-clicking it — it runs in your web browser
+with nothing to install. Drag the four files (P&ID PDF, Line List, Valve List,
+MEL) onto the page and click **Run consistency check**. You get the discrepancies
+on screen and a **Download Excel report** button. It needs an internet connection
+the first time you open it (to fetch two helper libraries).
+
+The two options below (web app / command line) are for when you want to run it
+from your own Python environment instead.
+
+## How to run the web app (the Python way)
 
 You need this **one-time setup**:
 

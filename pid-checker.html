@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P&amp;ID Consistency Checker</title>
+
+<!-- Helper libraries loaded from the internet (needed the first time you open this file):
+     pdf.js  -> reads text out of the PID PDF
+     SheetJS -> reads the Excel lists and writes the Excel report -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<style>
+:root{--error:#c0392b;--info:#2471a3;--ok:#1e8449;}
+*{box-sizing:border-box;}
+body{font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f6f8;color:#1d2733;}
+.container{max-width:1000px;margin:2rem auto;background:#fff;padding:2rem;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);}
+h1{margin-top:0;}
+.lead{color:#51606f;}
+#drop{border:2px dashed #aab4bd;border-radius:10px;padding:2.5rem 1rem;text-align:center;color:#51606f;cursor:pointer;transition:.15s;}
+#drop.hover{border-color:var(--info);background:#eaf2f8;color:#1d2733;}
+#drop strong{color:var(--info);}
+.files{list-style:none;padding:0;margin:1rem 0;}
+.files li{display:flex;align-items:center;gap:.6rem;padding:.4rem .2rem;border-bottom:1px solid #eef1f4;}
+.role{font-weight:600;min-width:170px;}
+.role.unknown{color:var(--error);}
+.fname{color:#51606f;font-size:13px;}
+button{background:#2471a3;color:#fff;border:0;padding:.7rem 1.4rem;font-size:1rem;border-radius:6px;cursor:pointer;}
+button:disabled{background:#9fb3c2;cursor:not-allowed;}
+button:hover:not(:disabled){background:#1b5a82;}
+.summary{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:1.5rem 0 1rem;}
+.badge{padding:.3rem .7rem;border-radius:20px;color:#fff;font-weight:600;}
+.badge.error{background:var(--error);}
+.badge.info{background:var(--info);}
+.badge.ok{background:var(--ok);}
+.download{margin-left:auto;background:var(--ok);color:#fff;padding:.55rem 1rem;border-radius:6px;text-decoration:none;border:0;font-size:1rem;cursor:pointer;}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:14px;}
+th,td{border:1px solid #e1e6ea;padding:.45rem .6rem;text-align:left;}
+th{background:#f0f3f6;position:sticky;top:0;}
+tr.bad td{background:#fdecea;}
+tr.bad td:nth-child(3){font-weight:600;color:var(--error);}
+details{margin-top:1rem;}
+summary{cursor:pointer;font-weight:600;}
+.scroll{max-height:420px;overflow:auto;border:1px solid #e1e6ea;border-radius:6px;}
+.scroll table{margin:0;}
+.flash{background:#fdecea;border:1px solid #f5c6cb;color:var(--error);padding:.6rem 1rem;border-radius:6px;}
+.muted{color:#51606f;font-size:13px;}
+#status{margin:1rem 0;font-weight:600;color:var(--info);}
+.hidden{display:none;}
+</style>
+</head>
+<body>
+<main class="container">
+  <h1>P&amp;ID Consistency Checker</h1>
+  <p class="lead">Drop your P&amp;ID PDF and the Line&nbsp;List, Valve&nbsp;List and MEL (Excel)
+  below. This finds every tag on the drawings and flags anything that is on a drawing
+  but missing from the matching list. Everything runs in your browser &mdash; nothing is uploaded.</p>
+
+  <div id="drop">
+    <p>📂 <strong>Drag your files here</strong> &mdash; or click to choose them<br>
+    <span class="muted">PID PDF + Line List + Valve List + MEL (you can drop all four at once)</span></p>
+    <input id="picker" type="file" multiple accept=".pdf,.xls,.xlsx" class="hidden">
+  </div>
+
+  <ul id="files" class="files"></ul>
+
+  <button id="run" disabled>Run consistency check</button>
+  <div id="status"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+// ---- pdf.js worker (also from the CDN) ----
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// ---- on-drawing tag conventions (mirrors check_project.py) ----
+const RE_EQ   = /\b(\d{3})-([A-Z]{2})-(\d{3})\b/g;
+const RE_VSZ  = /\b(\d{2,4})V(\d{2})([A-Z])\b/g;
+const RE_LINE = /\b(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})\b/g;
+const RE_DWG  = /\b(\d{3}-FP-\d{3})\b/;
+const NON_EQUIPMENT_CODES = new Set(["FP"]);   // drawing refs; VV handled separately
+
+const store = {pdf:null, line:null, valve:null, mel:null};
+const ROLE_LABEL = {pdf:"P&ID PDF", line:"Line List", valve:"Valve List", mel:"MEL (Equipment)"};
+
+// ---------- file intake + classification ----------
+const drop=document.getElementById("drop"), picker=document.getElementById("picker"),
+      filesUl=document.getElementById("files"), runBtn=document.getElementById("run"),
+      statusEl=document.getElementById("status"), resultsEl=document.getElementById("results");
+
+drop.addEventListener("click",()=>picker.click());
+picker.addEventListener("change",e=>intake([...e.target.files]));
+["dragover","dragenter"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("hover");}));
+["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("hover");}));
+drop.addEventListener("drop",e=>intake([...e.dataTransfer.files]));
+
+async function intake(fileList){
+  for(const f of fileList){
+    const role=await classify(f);
+    if(role) store[role]={file:f,name:f.name};
+    else store["_unknown_"+f.name]={file:f,name:f.name,unknown:true};
+  }
+  renderFiles();
+}
+
+async function classify(f){
+  const name=f.name.toLowerCase();
+  if(name.endsWith(".pdf")) return "pdf";
+  if(name.endsWith(".xls")||name.endsWith(".xlsx")){
+    try{
+      const wb=XLSX.read(await f.arrayBuffer(),{bookSheets:true});
+      const sheets=wb.SheetNames.map(s=>s.toLowerCase());
+      if(sheets.includes("equipment list")) return "mel";
+      if(sheets.includes("line list")) return "line";
+      if(sheets.some(s=>s.includes("plst")||s.includes("valve"))) return "valve";
+    }catch(_){}
+    if(name.includes("line")) return "line";
+    if(name.includes("valve")) return "valve";
+    if(name.includes("mel")||name.includes("equip")) return "mel";
+  }
+  return null;
+}
+
+function renderFiles(){
+  filesUl.innerHTML="";
+  for(const key of ["pdf","line","valve","mel"]){
+    if(store[key]){
+      filesUl.insertAdjacentHTML("beforeend",
+        `<li><span class="role">${ROLE_LABEL[key]}</span><span class="fname">${store[key].name}</span></li>`);
+    }
+  }
+  Object.keys(store).filter(k=>k.startsWith("_unknown_")).forEach(k=>{
+    filesUl.insertAdjacentHTML("beforeend",
+      `<li><span class="role unknown">Not recognised</span><span class="fname">${store[k].name}</span></li>`);
+  });
+  // need a PDF and at least one list to do anything useful
+  runBtn.disabled = !(store.pdf && (store.line||store.valve||store.mel));
+}
+
+// ---------- Excel helpers ----------
+async function rowsOf(file, sheetName, skipFirstDataRow=false){
+  const wb=XLSX.read(await file.arrayBuffer(),{type:"array"});
+  const name=wb.SheetNames.find(s=>s.toLowerCase()===sheetName.toLowerCase());
+  if(!name) return [];
+  let rows=XLSX.utils.sheet_to_json(wb.Sheets[name],{defval:"",raw:false});
+  return skipFirstDataRow ? rows.slice(1) : rows;
+}
+async function sheetsRows(file, predicate){
+  const wb=XLSX.read(await file.arrayBuffer(),{type:"array"});
+  const out=[];
+  for(const s of wb.SheetNames){ if(predicate(s.toLowerCase()))
+    out.push(XLSX.utils.sheet_to_json(wb.Sheets[s],{defval:"",raw:false})); }
+  return out;
+}
+const U=v=>String(v??"").trim().toUpperCase();
+const digits=v=>String(v).replace(/\D/g,"");
+
+// ---------- build reference sets (mirrors load_references) ----------
+async function buildReferences(){
+  const ref={equipment:new Set(),codes:new Set(),valves:new Set(),
+             servNum:new Set(),servSpecNum:new Set()};
+
+  if(store.mel){
+    const rows=await rowsOf(store.mel.file,"Equipment List");
+    for(const r of rows){
+      const m=U(r["Equipment No."]).match(/^(\d{3})-([A-Z]{2})-(\d{3})$/);
+      if(m){ ref.equipment.add(m[0]); ref.codes.add(m[2]); }
+    }
+  }
+  if(store.valve){
+    // main schedule sheet: union of the three identifier columns
+    const wb=XLSX.read(await store.valve.file.arrayBuffer(),{type:"array"});
+    for(const sName of wb.SheetNames){
+      const rows=XLSX.utils.sheet_to_json(wb.Sheets[sName],{defval:"",raw:false});
+      for(const r of rows){
+        for(const col of ["Valve Identifier","Valve Name Lookup","PATTERN","TAG","Valve Code","Valve Tag"]){
+          if(col in r){ const v=U(r[col]); if(v) ref.valves.add(v); }
+        }
+      }
+    }
+    ["","NAN","-","SPARE"].forEach(x=>ref.valves.delete(x));
+  }
+  if(store.line){
+    const rows=await rowsOf(store.line.file,"Line List",true); // skip sub-header row
+    const add=(serv,spec,num)=>{
+      serv=U(serv); num=digits(num);
+      if(!serv||!num) return;
+      num=String(parseInt(num,10));          // strip leading zeros (e.g. 027 -> 27)
+      ref.servNum.add(serv+"|"+num);
+      for(const sp of String(spec).toUpperCase().split(/[\s/\n]+/)){
+        if(sp.trim()&&sp!=="NAN") ref.servSpecNum.add(serv+"|"+sp.trim()+"|"+num);
+      }
+    };
+    for(const r of rows){
+      add(r["SERV CODE"],r["SPEC"],r["LINE No."]);
+      for(const k in r){                              // harvest fully-written line numbers
+        const text=String(r[k]).toUpperCase(); let m;
+        const rx=new RegExp(RE_LINE.source,"g");
+        while((m=rx.exec(text))){
+          ref.servNum.add(m[2]+"|"+String(parseInt(m[4],10)));
+          ref.servSpecNum.add(m[2]+"|"+m[3]+"|"+String(parseInt(m[4],10)));
+        }
+      }
+    }
+  }
+  return ref;
+}
+
+// ---------- read PDF text per page ----------
+async function pdfPages(file){
+  const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+  const pages=[];
+  for(let i=1;i<=pdf.numPages;i++){
+    const tc=await (await pdf.getPage(i)).getTextContent();
+    pages.push(tc.items.map(it=>it.str).join("\n"));
+  }
+  return pages;
+}
+
+// ---------- extract one page's tags (mirrors extract_page) ----------
+function extractPage(text, codes){
+  const T=text.toUpperCase();
+  const eq=new Set(),valves=new Set(),lines=new Set(),other=new Set();
+  let m;
+  let rx=new RegExp(RE_LINE.source,"g");
+  while((m=rx.exec(T))) lines.add(m[0]);
+  rx=new RegExp(RE_EQ.source,"g");
+  while((m=rx.exec(T))){
+    const code=m[2], tag=m[0];
+    if(NON_EQUIPMENT_CODES.has(code)) continue;
+    if(code==="VV") valves.add(tag);
+    else if(codes.has(code)) eq.add(tag);
+    else other.add(tag);
+  }
+  rx=new RegExp(RE_VSZ.source,"g");
+  while((m=rx.exec(T))) valves.add(m[0]);
+  return {eq,valves,lines,other};
+}
+function lineInList(tag,ref){
+  const m=tag.match(/\b(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})\b/);
+  const s=m[2],sp=m[3],n=String(parseInt(m[4],10));
+  return ref.servSpecNum.has(s+"|"+sp+"|"+n)||ref.servNum.has(s+"|"+n);
+}
+
+// ---------- main run ----------
+runBtn.addEventListener("click",run);
+async function run(){
+  runBtn.disabled=true; resultsEl.innerHTML="";
+  try{
+    statusEl.textContent="Reading the lists…";
+    const ref=await buildReferences();
+    statusEl.textContent="Reading the drawings…";
+    const pages=await pdfPages(store.pdf.file);
+
+    const rows=[];
+    const sortedAdd=(set,fn)=>[...set].sort().forEach(fn);
+    pages.forEach(text=>{
+      const dwgM=text.toUpperCase().match(RE_DWG);
+      const dwg=dwgM?dwgM[1]:"(unknown drawing)";
+      const f=extractPage(text,ref.codes);
+      if(store.mel){
+        sortedAdd(f.eq,t=>rows.push([dwg,"Equipment",t,"MEL",ref.equipment.has(t)?"IN LIST":"NOT IN MEL"]));
+        sortedAdd(f.other,t=>rows.push([dwg,"Other",t,"MEL","NOT IN MEL (untracked type)"]));
+      }
+      if(store.valve)
+        sortedAdd(f.valves,t=>rows.push([dwg,"Valve",t,"Valve List",ref.valves.has(t)?"IN LIST":"NOT IN VALVE LIST"]));
+      if(store.line)
+        sortedAdd(f.lines,t=>rows.push([dwg,"Line",t,"Line List",lineInList(t,ref)?"IN LIST":"NOT IN LINE LIST"]));
+    });
+
+    render(rows,pages.length);
+    statusEl.textContent="";
+  }catch(err){
+    statusEl.textContent="";
+    resultsEl.innerHTML=`<p class="flash">Something went wrong: ${err.message}</p>`;
+    console.error(err);
+  }
+  runBtn.disabled=false;
+}
+
+// ---------- show results + offer Excel download ----------
+let lastReport=null;
+function render(rows,pageCount){
+  const disc=rows.filter(r=>r[4]!=="IN LIST");
+  const count=cat=>rows.filter(r=>r[1]===cat).length;
+  lastReport={rows,disc,pageCount,
+    counts:{eq:count("Equipment"),valve:count("Valve"),line:count("Line"),other:count("Other")}};
+
+  const badge=(cls,txt)=>`<span class="badge ${cls}">${txt}</span>`;
+  let html=`<div class="summary">
+      ${badge(disc.length?"error":"ok", disc.length+" discrepancies")}
+      ${badge("info",pageCount+" drawings")}
+      ${badge("info",lastReport.counts.eq+" equipment")}
+      ${badge("info",lastReport.counts.valve+" valves")}
+      ${badge("info",lastReport.counts.line+" lines")}
+      <button class="download" id="dl">Download Excel report</button>
+    </div>`;
+
+  html+=`<h2>Discrepancies — on a P&amp;ID but missing from a list</h2>`;
+  if(disc.length){
+    html+=tableHtml(["P&ID","Category","Tag","Checked against","Status"],disc,true);
+  }else{
+    html+=`<p class="badge ok" style="display:inline-block">No discrepancies — every tag on the drawings is in its list. 🎉</p>`;
+  }
+  html+=`<details><summary>Full P&amp;ID inventory (${rows.length} tags) — check completeness</summary>
+      <div class="scroll">${tableHtml(["P&ID","Category","Tag","Checked against","Status"],rows,true)}</div></details>`;
+  resultsEl.innerHTML=html;
+  document.getElementById("dl").addEventListener("click",downloadExcel);
+}
+function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function tableHtml(headers,data,flagBad){
+  let h="<table><thead><tr>"+headers.map(x=>`<th>${esc(x)}</th>`).join("")+"</tr></thead><tbody>";
+  for(const row of data){
+    const bad=flagBad&&row[4]!=="IN LIST";
+    h+=`<tr class="${bad?'bad':''}">`+row.map(c=>`<td>${esc(c)}</td>`).join("")+"</tr>";
+  }
+  return h+"</tbody></table>";
+}
+function downloadExcel(){
+  if(!lastReport) return;
+  const head=["P&ID","Category","Tag","Checked Against","Status"];
+  const toAoA=arr=>[head,...arr];
+  const c=lastReport.counts;
+  const summary=[["Metric","Value"],
+    ["P&ID pages",lastReport.pageCount],["Equipment found",c.eq],["Valves found",c.valve],
+    ["Lines found",c.line],["Other tagged items",c.other],
+    ["DISCREPANCIES (on P&ID, not in list)",lastReport.disc.length]];
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(summary),"Summary");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(toAoA(lastReport.disc)),"Discrepancies");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(toAoA(lastReport.rows)),"Full PID Inventory");
+  XLSX.writeFile(wb,"PID_Check_Report.xlsx");
+}
+</script>
+</body>
+</html>

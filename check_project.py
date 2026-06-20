@@ -71,6 +71,7 @@ def load_references(line_path, valve_path, mel_path):
         num = re.sub(r"\D", "", str(num))
         if not serv or not num:
             return
+        num = str(int(num))  # strip leading zeros (e.g. 027 -> 27) for consistent keys
         serv_num.add((serv, num))
         for sp in re.split(r"[\s/\n]+", str(spec).upper()):
             if sp.strip() and sp != "NAN":
