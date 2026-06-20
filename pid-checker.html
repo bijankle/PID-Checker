@@ -162,17 +162,19 @@ function findKey(obj,...wanted){const w=wanted.map(normKey);for(const k in obj) 
 // ---------- build reference sets (mirrors load_references) ----------
 async function buildReferences(){
   const ref={equipment:new Set(),codes:new Set(),valves:new Set(),
-             servNum:new Set(),servSpecNum:new Set(),declaredPid:{}};
+             servNum:new Set(),servSpecNum:new Set(),declaredPid:{},names:{}};
 
   if(store.mel){
     const rows=await rowsOf(store.mel.file,"Equipment List");
     const eqKey=rows.length?(findKey(rows[0],"Equipment No.")||"Equipment No."):"Equipment No.";
     const pidKey=rows.length?findKey(rows[0],"P&ID No.","PID No."):null;  // home drawing per MEL
+    const nameKey=rows.length?findKey(rows[0],"Equipment Name","Description","Equipment Description"):null;
     for(const r of rows){
       const m=U(r[eqKey]).match(/^(\d{3})-([A-Z]{2})-(\d{3})$/);
       if(m){
         ref.equipment.add(m[0]); ref.codes.add(m[2]);
         if(pidKey){ const dm=String(r[pidKey]).toUpperCase().match(/\b(\d{3}-FP-\d{3})\b/); if(dm) ref.declaredPid[m[0]]=dm[1]; }
+        if(nameKey){ const nm=String(r[nameKey]).trim(); if(nm&&nm.toLowerCase()!=="nan") ref.names[m[0]]=nm; }
       }
     }
   }
@@ -234,22 +236,27 @@ async function pdfPages(file){
 }
 
 // ---------- extract one page's tags (mirrors extract_page) ----------
-function extractPage(text, codes){
+function extractPage(text, codes, minOcc=2){
+  // Equipment must appear >= minOcc times to count as belonging to this sheet
+  // (genuine equipment is labelled twice; cross-references from other drawings
+  // appear once). Valves are single-labelled and not thresholded.
   const T=text.toUpperCase();
-  const eq=new Set(),valves=new Set(),lines=new Set(),other=new Set();
-  let m;
-  let rx=new RegExp(RE_LINE.source,"g");
-  while((m=rx.exec(T))) lines.add(m[0]);
+  const valves=new Set(),lines=new Set(),eqCount={};
+  let m,rx;
+  rx=new RegExp(RE_LINE.source,"g"); while((m=rx.exec(T))) lines.add(m[0]);
   rx=new RegExp(RE_EQ.source,"g");
   while((m=rx.exec(T))){
     const code=m[2], tag=m[0];
     if(NON_EQUIPMENT_CODES.has(code)) continue;
     if(code==="VV") valves.add(tag);
-    else if(codes.has(code)) eq.add(tag);
-    else other.add(tag);
+    else eqCount[tag]=(eqCount[tag]||0)+1;
   }
-  rx=new RegExp(RE_VSZ.source,"g");
-  while((m=rx.exec(T))) valves.add(m[0]);
+  rx=new RegExp(RE_VSZ.source,"g"); while((m=rx.exec(T))) valves.add(m[0]);
+  const eq=new Set(),other=new Set();
+  for(const tag in eqCount){
+    if(eqCount[tag]<minOcc) continue;       // appears once -> cross-reference
+    if(codes.has(tag.split("-")[1])) eq.add(tag); else other.add(tag);
+  }
   return {eq,valves,lines,other};
 }
 function lineInList(tag,ref){
@@ -279,14 +286,14 @@ async function run(){
           if(!ref.equipment.has(t)) status="NOT IN MEL";
           else if(ref.declaredPid[t] && ref.declaredPid[t]!==dwg) status="P&ID MISMATCH (MEL says "+ref.declaredPid[t]+")";
           else status="IN LIST";
-          rows.push([dwg,"Equipment",t,"MEL",status]);
+          rows.push([dwg,"Equipment",t,ref.names[t]||"","MEL",status]);
         });
-        sortedAdd(f.other,t=>rows.push([dwg,"Other",t,"MEL","NOT IN MEL (untracked type)"]));
+        sortedAdd(f.other,t=>rows.push([dwg,"Other",t,"","MEL","NOT IN MEL (untracked type)"]));
       }
       if(store.valve)
-        sortedAdd(f.valves,t=>rows.push([dwg,"Valve",t,"Valve List",ref.valves.has(t)?"IN LIST":"NOT IN VALVE LIST"]));
+        sortedAdd(f.valves,t=>rows.push([dwg,"Valve",t,"","Valve List",ref.valves.has(t)?"IN LIST":"NOT IN VALVE LIST"]));
       if(store.line)
-        sortedAdd(f.lines,t=>rows.push([dwg,"Line",t,"Line List",lineInList(t,ref)?"IN LIST":"NOT IN LINE LIST"]));
+        sortedAdd(f.lines,t=>rows.push([dwg,"Line",t,"","Line List",lineInList(t,ref)?"IN LIST":"NOT IN LINE LIST"]));
     });
 
     render(rows,pages.length);
@@ -301,8 +308,9 @@ async function run(){
 
 // ---------- show results + offer Excel download ----------
 let lastReport=null;
+const STATUS=r=>r[r.length-1];   // status is always the last column
 function render(rows,pageCount){
-  const disc=rows.filter(r=>r[4]!=="IN LIST");
+  const disc=rows.filter(r=>STATUS(r)!=="IN LIST");
   const count=cat=>rows.filter(r=>r[1]===cat).length;
   lastReport={rows,disc,pageCount,
     counts:{eq:count("Equipment"),valve:count("Valve"),line:count("Line"),other:count("Other")}};
@@ -319,12 +327,12 @@ function render(rows,pageCount){
 
   html+=`<h2>Discrepancies — on a P&amp;ID but missing from a list</h2>`;
   if(disc.length){
-    html+=tableHtml(["P&ID","Category","Tag","Checked against","Status"],disc,true);
+    html+=tableHtml(["P&ID","Category","Tag","Description","Checked against","Status"],disc,true);
   }else{
     html+=`<p class="badge ok" style="display:inline-block">No discrepancies — every tag on the drawings is in its list. 🎉</p>`;
   }
   html+=`<details><summary>Full P&amp;ID inventory (${rows.length} tags) — check completeness</summary>
-      <div class="scroll">${tableHtml(["P&ID","Category","Tag","Checked against","Status"],rows,true)}</div></details>`;
+      <div class="scroll">${tableHtml(["P&ID","Category","Tag","Description","Checked against","Status"],rows,true)}</div></details>`;
   resultsEl.innerHTML=html;
   document.getElementById("dl").addEventListener("click",downloadExcel);
 }
@@ -332,14 +340,14 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">
 function tableHtml(headers,data,flagBad){
   let h="<table><thead><tr>"+headers.map(x=>`<th>${esc(x)}</th>`).join("")+"</tr></thead><tbody>";
   for(const row of data){
-    const bad=flagBad&&row[4]!=="IN LIST";
+    const bad=flagBad&&row[row.length-1]!=="IN LIST";
     h+=`<tr class="${bad?'bad':''}">`+row.map(c=>`<td>${esc(c)}</td>`).join("")+"</tr>";
   }
   return h+"</tbody></table>";
 }
 function downloadExcel(){
   if(!lastReport) return;
-  const head=["P&ID","Category","Tag","Checked Against","Status"];
+  const head=["P&ID","Category","Tag","Description","Checked Against","Status"];
   const toAoA=arr=>[head,...arr];
   const c=lastReport.counts;
   const summary=[["Metric","Value"],

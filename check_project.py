@@ -17,8 +17,13 @@ Scope decisions (per project owner):
   * The drawing number is read from the title block by position (the FP word
     nearest the bottom of the sheet), so cross-references to other drawings on
     the same sheet do not get mistaken for the sheet's own number.
+  * Equipment counts as belonging to a sheet only if its tag appears at least
+    twice on it (genuine equipment is labelled at the symbol and in the
+    reference block; cross-references from other sheets appear once). This is
+    what stops equipment being paired with the wrong P&ID.
   * For equipment, the drawing it is found on is compared against the MEL's
-    "P&ID No." column; a mismatch is flagged ("P&ID MISMATCH").
+    "P&ID No." column; a mismatch is flagged ("P&ID MISMATCH"). The MEL
+    "Equipment Name" is carried through as a Description column.
 
 Run:  python check_project.py PID.pdf Line_List.xlsx Valve_List.xlsx MEL.xlsx [out.xlsx]
 """
@@ -26,6 +31,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections import Counter
 
 import fitz
 import pandas as pd
@@ -68,9 +74,10 @@ def load_references(line_path, valve_path, mel_path):
     """Build the identifier sets each P&ID tag is checked against."""
     # MEL equipment + the set of valid equipment type codes + declared P&ID.
     mel = pd.read_excel(mel_path, sheet_name="Equipment List", header=0, dtype=str)
-    equipment, codes, declared_pid = set(), set(), {}
+    equipment, codes, declared_pid, names = set(), set(), {}, {}
     eq_col = _find_col(mel.columns, "Equipment No.") or "Equipment No."
     pid_col = _find_col(mel.columns, "P&ID No.", "P&ID\nNo.", "PID No.")
+    name_col = _find_col(mel.columns, "Equipment Name", "Description", "Equipment Description")
     for _, row in mel.iterrows():
         m = RE_EQ.fullmatch(str(row.get(eq_col)).strip().upper())
         if not m:
@@ -81,6 +88,10 @@ def load_references(line_path, valve_path, mel_path):
             dm = RE_DWG.search(str(row.get(pid_col)).upper())
             if dm:
                 declared_pid[m.group(0)] = dm.group(1)
+        if name_col is not None:
+            v = str(row.get(name_col)).strip()
+            if v and v.lower() != "nan":
+                names[m.group(0)] = v
 
     # Valve identifiers: union of every identifier-bearing column / sheet.
     valves = set()
@@ -121,27 +132,43 @@ def load_references(line_path, valve_path, mel_path):
 
     return {"equipment": equipment, "codes": codes, "valves": valves,
             "serv_num": serv_num, "serv_spec_num": serv_spec_num,
-            "declared_pid": declared_pid}
+            "declared_pid": declared_pid, "names": names}
 
 
-def extract_page(text, codes):
-    """Return dict of category -> set(tags) found in one page's text."""
+def extract_page(text, codes, min_equipment_occurrences=2):
+    """Return dict of category -> set(tags) found in one page's text.
+
+    Equipment (and other AREA-XX-NNN items) must appear at least
+    `min_equipment_occurrences` times to count as belonging to this sheet:
+    genuine equipment is labelled twice (at the symbol and in the reference
+    block), whereas equipment merely cross-referenced from another drawing
+    appears once. This stops cross-references being paired with the wrong P&ID.
+    Valves (sized / VV) are single-labelled, so they are not thresholded.
+    """
     T = text.upper()
-    eq, valves, lines, other = set(), set(), set(), set()
-    for m in RE_LINE.finditer(T):
-        lines.add(m.group(0))
+    lines = {m.group(0) for m in RE_LINE.finditer(T)}
+    valves = set()
+    eq_counts = Counter()
     for m in RE_EQ.finditer(T):
         code, tag = m.group(2), m.group(0)
         if code in NON_EQUIPMENT_CODES:
             continue
         if code == "VV":
             valves.add(tag)
-        elif code in codes:
+        else:
+            eq_counts[tag] += 1
+    for m in RE_VSZ.finditer(T):
+        valves.add(m.group(0))
+
+    eq, other = set(), set()
+    for tag, c in eq_counts.items():
+        if c < min_equipment_occurrences:
+            continue   # appears once -> cross-reference from another sheet
+        code = tag.split("-")[1]
+        if code in codes:
             eq.add(tag)
         else:
             other.add(tag)   # tagged item whose type isn't a MEL code (CA, SP...)
-    for m in RE_VSZ.finditer(T):
-        valves.add(m.group(0))
     return {"Equipment": eq, "Valve": valves, "Line": lines, "Other": other}
 
 
@@ -159,6 +186,7 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
     """
     ref = load_references(line_path, valve_path, mel_path)
     declared = ref["declared_pid"]
+    names = ref["names"]
     rows = []
     with fitz.open(pdf_path) as doc:
         for page in doc:
@@ -173,20 +201,20 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
                     status = f"P&ID MISMATCH (MEL says {declared[tag]})"
                 else:
                     status = "IN LIST"
-                rows.append([dwg, "Equipment", tag, "MEL", status])
+                rows.append([dwg, "Equipment", tag, names.get(tag, ""), "MEL", status])
             for tag in sorted(found["Valve"]):
                 ok = tag in ref["valves"]
-                rows.append([dwg, "Valve", tag, "Valve List",
+                rows.append([dwg, "Valve", tag, "", "Valve List",
                              "IN LIST" if ok else "NOT IN VALVE LIST"])
             for tag in sorted(found["Line"]):
                 ok = line_in_list(tag, ref)
-                rows.append([dwg, "Line", tag, "Line List",
+                rows.append([dwg, "Line", tag, "", "Line List",
                              "IN LIST" if ok else "NOT IN LINE LIST"])
             for tag in sorted(found["Other"]):
                 # per scope decision: untracked tagged items are discrepancies
-                rows.append([dwg, "Other", tag, "MEL", "NOT IN MEL (untracked type)"])
+                rows.append([dwg, "Other", tag, "", "MEL", "NOT IN MEL (untracked type)"])
 
-    df = pd.DataFrame(rows, columns=["P&ID", "Category", "Tag",
+    df = pd.DataFrame(rows, columns=["P&ID", "Category", "Tag", "Description",
                                      "Checked Against", "Status"])
     disc = df[df["Status"] != "IN LIST"].reset_index(drop=True)
     summary = pd.DataFrame({

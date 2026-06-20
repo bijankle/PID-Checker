@@ -22,14 +22,17 @@ def _make_pdf(path):
     doc = fitz.open()
     page = doc.new_page(width=842, height=595)
     page.insert_text((50, 40), "130-FP-099")           # cross-reference near the top
-    page.insert_text((50, 90), "121-CV-014")           # equipment, MEL home = this sheet
-    page.insert_text((50, 110), "121-PP-002")          # equipment, MEL home = a DIFFERENT sheet
-    page.insert_text((50, 130), "121-CV-099")          # equipment NOT in MEL
-    page.insert_text((50, 150), "120-VV-003")          # valve in list
+    page.insert_text((50, 60), "121-DC-050")           # equipment cross-ref: appears ONCE -> ignored
+    # Genuine equipment / cameras are labelled twice (symbol + reference block):
+    for y in (90, 320):
+        page.insert_text((50, y), "121-CV-014")        # equipment, MEL home = this sheet
+        page.insert_text((150, y), "121-PP-002")       # equipment, MEL home = a DIFFERENT sheet
+        page.insert_text((250, y), "121-CV-099")       # equipment NOT in MEL
+        page.insert_text((350, y), "120-CA-202")       # camera: untracked type
+    page.insert_text((50, 150), "120-VV-003")          # valve in list (single label)
     page.insert_text((50, 170), "50V11A")              # sized valve in list
     page.insert_text((50, 190), "25-PW-S31-027")       # line in list
     page.insert_text((50, 210), "25-PW-S31-999")       # line NOT in list
-    page.insert_text((50, 230), "120-CA-202")          # camera: untracked type
     page.insert_text((700, 575), "120-FP-001")         # the real drawing number (title block, bottom-right)
     doc.save(path)
     doc.close()
@@ -40,6 +43,7 @@ def _make_lists(tmp_path):
     pd.DataFrame({
         "Equipment No.": ["121-CV-014", "121-PP-002"],
         "P&ID\nNo.": ["120-FP-001", "130-FP-002"],   # PP-002's home is a different sheet
+        "Equipment Name": ["Primary Crusher", "Crushing Water Pump"],
     }).to_excel(mel, sheet_name="Equipment List", index=False)
 
     valve = tmp_path / "valve.xlsx"
@@ -72,6 +76,11 @@ def test_analyze(tmp_path):
     assert set(df["P&ID"]) == {"120-FP-001"}
 
     status = dict(zip(df["Tag"], df["Status"]))
+    desc = dict(zip(df["Tag"], df["Description"]))
+
+    # equipment that appears only once is a cross-reference and must be ignored
+    assert "121-DC-050" not in status
+
     assert status["121-CV-099"] == "NOT IN MEL"
     assert status["25-PW-S31-999"] == "NOT IN LINE LIST"
     assert status["120-CA-202"].startswith("NOT IN MEL")
@@ -82,6 +91,9 @@ def test_analyze(tmp_path):
     assert status["120-VV-003"] == "IN LIST"
     assert status["50V11A"] == "IN LIST"
     assert status["25-PW-S31-027"] == "IN LIST"   # zero-padded list entry still matches
+
+    # the MEL description is carried through to the table
+    assert desc["121-CV-014"] == "Primary Crusher"
 
 
 if __name__ == "__main__":
