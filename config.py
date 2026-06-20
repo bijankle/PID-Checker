@@ -23,9 +23,9 @@ TITLE_BLOCK = {
     "y1_frac": 1.00,   # bottom edge
 }
 
-# Regex used to recognise a drawing / P&ID number. This is intentionally broad;
-# narrow it once we see the real numbering scheme (e.g. r"PID-\d{3}-\d{4}").
-DRAWING_NUMBER_PATTERN = r"[A-Z0-9]{1,5}[-_][A-Z0-9]{2,6}(?:[-_][A-Z0-9]{1,6}){0,3}"
+# Regex used to recognise a drawing / P&ID number. Calibrated to the 2233
+# Kathleen Valley drawings, whose P&IDs are numbered AREA-FP-NNN (e.g. 120-FP-001).
+DRAWING_NUMBER_PATTERN = r"\d{3}-FP-\d{3}"
 
 # Optional label that precedes the number in the title block, e.g. "DWG NO".
 # When present we prefer the token that follows it.
@@ -38,15 +38,16 @@ DRAWING_NUMBER_LABELS = ["DWG NO", "DWG. NO", "DRAWING NO", "P&ID NO", "PID NO",
 # These match the identifiers as they appear *on the P&ID*. Calibrate to the
 # project's tagging convention. Each is a (name, regex) so report rows are
 # labelled by item type.
+# Calibrated to the 2233 Kathleen Valley tagging convention. The reconciler
+# also uses the MEL's set of two-letter type codes to tell equipment apart from
+# other AREA-XX-NNN tags (cameras CA, stockpiles SP, etc.) — see check_project.py.
 TAG_PATTERNS = {
-    # e.g. 6"-P-1001-A1A  /  6-P-1001  /  150-CWS-001
-    "line": r'\b\d{1,2}"?-?[A-Z]{1,4}-?\d{3,5}(?:-[A-Z0-9]{1,5})?\b',
-    # e.g. FV-1001, HV-200A, PSV-3001
-    "valve": r"\b[A-Z]{1,4}V-\d{2,5}[A-Z]?\b",
-    # e.g. TI-12, TIE-045, T-001
-    "tie_in": r"\bTIE?[-_]?\d{1,4}[A-Z]?\b",
-    # e.g. P-101, E-2003, V-12A, C-300
-    "equipment": r"\b[A-Z]{1,3}-\d{2,4}[A-Z]?\b",
+    # Line numbers: SIZE-SERV-SPEC-NNN, e.g. 25-PW-S31-027, 100-PA-P35-267
+    "line": r"\b\d{2,4}-[A-Z]{2,3}-[A-Z]\d{2}-\d{3}\b",
+    # Valves: sized tag 50V11A  OR  pattern tag AREA-VV-NNN (e.g. 120-VV-003)
+    "valve": r"\b(?:\d{2,4}V\d{2}[A-Z]|\d{3}-VV-\d{3})\b",
+    # Equipment: AREA-TYPE-NNN, e.g. 121-CV-014 (type validated against the MEL)
+    "equipment": r"\b\d{3}-[A-Z]{2}-\d{3}\b",
 }
 
 # ---------------------------------------------------------------------------

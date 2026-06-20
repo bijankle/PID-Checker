@@ -7,3 +7,8 @@ uploads/*
 *.xlsx
 !tests/**/*.xlsx
 .DS_Store
+
+# scratch/debug artifacts
+_*.png
+_*.pkl
+PID_Check_Report.xlsx
