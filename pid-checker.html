@@ -236,12 +236,10 @@ async function pdfPages(file){
 }
 
 // ---------- extract one page's tags (mirrors extract_page) ----------
-function extractPage(text, codes, minOcc=2){
-  // Equipment must appear >= minOcc times to count as belonging to this sheet
-  // (genuine equipment is labelled twice; cross-references from other drawings
-  // appear once). Valves are single-labelled and not thresholded.
+function pageTags(text, codes){
+  // Raw per-page tally; the twice-rule is applied later, across all pages.
   const T=text.toUpperCase();
-  const valves=new Set(),lines=new Set(),eqCount={};
+  const valves=new Set(),lines=new Set(),eqCount={},otherCount={};
   let m,rx;
   rx=new RegExp(RE_LINE.source,"g"); while((m=rx.exec(T))) lines.add(m[0]);
   rx=new RegExp(RE_EQ.source,"g");
@@ -249,15 +247,11 @@ function extractPage(text, codes, minOcc=2){
     const code=m[2], tag=m[0];
     if(NON_EQUIPMENT_CODES.has(code)) continue;
     if(code==="VV") valves.add(tag);
-    else eqCount[tag]=(eqCount[tag]||0)+1;
+    else if(codes.has(code)) eqCount[tag]=(eqCount[tag]||0)+1;
+    else otherCount[tag]=(otherCount[tag]||0)+1;
   }
   rx=new RegExp(RE_VSZ.source,"g"); while((m=rx.exec(T))) valves.add(m[0]);
-  const eq=new Set(),other=new Set();
-  for(const tag in eqCount){
-    if(eqCount[tag]<minOcc) continue;       // appears once -> cross-reference
-    if(codes.has(tag.split("-")[1])) eq.add(tag); else other.add(tag);
-  }
-  return {eq,valves,lines,other};
+  return {valves,lines,eqCount,otherCount};
 }
 function lineInList(tag,ref){
   const m=tag.match(/\b(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})\b/);
@@ -275,25 +269,38 @@ async function run(){
     statusEl.textContent="Reading the drawings…";
     const pages=await pdfPages(store.pdf.file);
 
+    const ONLY_ONCE="Only labelled once — verify (possible cross-reference)";
+    // pass 1: per-page tags + each tag's home sheets (labelled >=2 times)
+    const perPage=pages.map(p=>({dwg:p.dwg||"(unknown drawing)", ...pageTags(p.text,ref.codes)}));
+    const homes={};
+    const addHome=(o,dwg)=>{for(const t in o) if(o[t]>=2){(homes[t]=homes[t]||new Set()).add(dwg);}};
+    perPage.forEach(pg=>{addHome(pg.eqCount,pg.dwg);addHome(pg.otherCount,pg.dwg);});
+
+    // pass 2: build rows  [P&ID, Category, Tag, Checked against, Status, Notes]
     const rows=[];
-    const sortedAdd=(set,fn)=>[...set].sort().forEach(fn);
-    pages.forEach(p=>{
-      const dwg=p.dwg||"(unknown drawing)";
-      const f=extractPage(p.text,ref.codes);
+    const keys=o=>Object.keys(o).sort();
+    perPage.forEach(pg=>{
+      const dwg=pg.dwg;
       if(store.mel){
-        sortedAdd(f.eq,t=>{
+        keys(pg.eqCount).forEach(t=>{
+          let note="";
+          if(pg.eqCount[t]<2){ if(homes[t]) return; note=ONLY_ONCE; }
           let status;
           if(!ref.equipment.has(t)) status="NOT IN MEL";
           else if(ref.declaredPid[t] && ref.declaredPid[t]!==dwg) status="P&ID MISMATCH (MEL says "+ref.declaredPid[t]+")";
           else status="IN LIST";
-          rows.push([dwg,"Equipment",t,ref.names[t]||"","MEL",status]);
+          rows.push([dwg,"Equipment",t,"MEL",status,note]);
         });
-        sortedAdd(f.other,t=>rows.push([dwg,"Other",t,"","MEL","NOT IN MEL (untracked type)"]));
+        keys(pg.otherCount).forEach(t=>{
+          let note="";
+          if(pg.otherCount[t]<2){ if(homes[t]) return; note=ONLY_ONCE; }
+          rows.push([dwg,"Other",t,"MEL","NOT IN MEL (untracked type)",note]);
+        });
       }
       if(store.valve)
-        sortedAdd(f.valves,t=>rows.push([dwg,"Valve",t,"","Valve List",ref.valves.has(t)?"IN LIST":"NOT IN VALVE LIST"]));
+        [...pg.valves].sort().forEach(t=>rows.push([dwg,"Valve",t,"Valve List",ref.valves.has(t)?"IN LIST":"NOT IN VALVE LIST",""]));
       if(store.line)
-        sortedAdd(f.lines,t=>rows.push([dwg,"Line",t,"","Line List",lineInList(t,ref)?"IN LIST":"NOT IN LINE LIST"]));
+        [...pg.lines].sort().forEach(t=>rows.push([dwg,"Line",t,"Line List",lineInList(t,ref)?"IN LIST":"NOT IN LINE LIST",""]));
     });
 
     render(rows,pages.length);
@@ -308,31 +315,35 @@ async function run(){
 
 // ---------- show results + offer Excel download ----------
 let lastReport=null;
-const STATUS=r=>r[r.length-1];   // status is always the last column
+const STATUS_IDX=4, NOTES_IDX=5;     // columns: P&ID,Category,Tag,Checked,Status,Notes
+const NEEDS=r=>r[STATUS_IDX]!=="IN LIST"||r[NOTES_IDX]!=="";
+const HEADERS=["P&ID","Category","Tag","Checked against","Status","Notes"];
 function render(rows,pageCount){
-  const disc=rows.filter(r=>STATUS(r)!=="IN LIST");
+  const disc=rows.filter(NEEDS);
   const count=cat=>rows.filter(r=>r[1]===cat).length;
-  lastReport={rows,disc,pageCount,
+  const onceCount=rows.filter(r=>r[NOTES_IDX]!=="").length;
+  lastReport={rows,disc,pageCount,once:onceCount,
     counts:{eq:count("Equipment"),valve:count("Valve"),line:count("Line"),other:count("Other")}};
 
   const badge=(cls,txt)=>`<span class="badge ${cls}">${txt}</span>`;
   let html=`<div class="summary">
-      ${badge(disc.length?"error":"ok", disc.length+" discrepancies")}
+      ${badge(disc.length?"error":"ok", disc.length+" to review")}
       ${badge("info",pageCount+" drawings")}
       ${badge("info",lastReport.counts.eq+" equipment")}
       ${badge("info",lastReport.counts.valve+" valves")}
       ${badge("info",lastReport.counts.line+" lines")}
+      ${onceCount?badge("info",onceCount+" labelled once"):""}
       <button class="download" id="dl">Download Excel report</button>
     </div>`;
 
-  html+=`<h2>Discrepancies — on a P&amp;ID but missing from a list</h2>`;
+  html+=`<h2>Discrepancies &amp; items to review</h2>`;
   if(disc.length){
-    html+=tableHtml(["P&ID","Category","Tag","Description","Checked against","Status"],disc,true);
+    html+=tableHtml(HEADERS,disc,true);
   }else{
     html+=`<p class="badge ok" style="display:inline-block">No discrepancies — every tag on the drawings is in its list. 🎉</p>`;
   }
   html+=`<details><summary>Full P&amp;ID inventory (${rows.length} tags) — check completeness</summary>
-      <div class="scroll">${tableHtml(["P&ID","Category","Tag","Description","Checked against","Status"],rows,true)}</div></details>`;
+      <div class="scroll">${tableHtml(HEADERS,rows,true)}</div></details>`;
   resultsEl.innerHTML=html;
   document.getElementById("dl").addEventListener("click",downloadExcel);
 }
@@ -340,20 +351,21 @@ function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">
 function tableHtml(headers,data,flagBad){
   let h="<table><thead><tr>"+headers.map(x=>`<th>${esc(x)}</th>`).join("")+"</tr></thead><tbody>";
   for(const row of data){
-    const bad=flagBad&&row[row.length-1]!=="IN LIST";
+    const bad=flagBad&&(row[STATUS_IDX]!=="IN LIST"||row[NOTES_IDX]!=="");
     h+=`<tr class="${bad?'bad':''}">`+row.map(c=>`<td>${esc(c)}</td>`).join("")+"</tr>";
   }
   return h+"</tbody></table>";
 }
 function downloadExcel(){
   if(!lastReport) return;
-  const head=["P&ID","Category","Tag","Description","Checked Against","Status"];
+  const head=["P&ID","Category","Tag","Checked Against","Status","Notes"];
   const toAoA=arr=>[head,...arr];
   const c=lastReport.counts;
   const summary=[["Metric","Value"],
     ["P&ID pages",lastReport.pageCount],["Equipment found",c.eq],["Valves found",c.valve],
     ["Lines found",c.line],["Other tagged items",c.other],
-    ["DISCREPANCIES (on P&ID, not in list)",lastReport.disc.length]];
+    ["Labelled once (verify)",lastReport.once],
+    ["DISCREPANCIES / items to review",lastReport.disc.length]];
   const wb=XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(summary),"Summary");
   XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(toAoA(lastReport.disc)),"Discrepancies");

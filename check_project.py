@@ -135,41 +135,28 @@ def load_references(line_path, valve_path, mel_path):
             "declared_pid": declared_pid, "names": names}
 
 
-def extract_page(text, codes, min_equipment_occurrences=2):
-    """Return dict of category -> set(tags) found in one page's text.
-
-    Equipment (and other AREA-XX-NNN items) must appear at least
-    `min_equipment_occurrences` times to count as belonging to this sheet:
-    genuine equipment is labelled twice (at the symbol and in the reference
-    block), whereas equipment merely cross-referenced from another drawing
-    appears once. This stops cross-references being paired with the wrong P&ID.
-    Valves (sized / VV) are single-labelled, so they are not thresholded.
-    """
+def page_tags(text, codes):
+    """Parse one page's text into:
+       valves (set), lines (set), eq_counts (Counter of MEL-code equipment),
+       other_counts (Counter of AREA-XX-NNN tags whose type isn't a MEL code).
+    Counts are raw occurrences; the twice-rule is applied later, across pages."""
     T = text.upper()
     lines = {m.group(0) for m in RE_LINE.finditer(T)}
     valves = set()
-    eq_counts = Counter()
+    eq_counts, other_counts = Counter(), Counter()
     for m in RE_EQ.finditer(T):
         code, tag = m.group(2), m.group(0)
         if code in NON_EQUIPMENT_CODES:
             continue
         if code == "VV":
             valves.add(tag)
-        else:
+        elif code in codes:
             eq_counts[tag] += 1
+        else:
+            other_counts[tag] += 1
     for m in RE_VSZ.finditer(T):
         valves.add(m.group(0))
-
-    eq, other = set(), set()
-    for tag, c in eq_counts.items():
-        if c < min_equipment_occurrences:
-            continue   # appears once -> cross-reference from another sheet
-        code = tag.split("-")[1]
-        if code in codes:
-            eq.add(tag)
-        else:
-            other.add(tag)   # tagged item whose type isn't a MEL code (CA, SP...)
-    return {"Equipment": eq, "Valve": valves, "Line": lines, "Other": other}
+    return valves, lines, eq_counts, other_counts
 
 
 def line_in_list(tag, ref):
@@ -185,46 +172,69 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
     it and present the results however they like.
     """
     ref = load_references(line_path, valve_path, mel_path)
-    declared = ref["declared_pid"]
-    names = ref["names"]
-    rows = []
+    declared, names = ref["declared_pid"], ref["names"]
+
+    ONLY_ONCE = "Only labelled once — verify (possible cross-reference)"
+
+    # ---- pass 1: read every page and tally occurrences -------------------
+    pages = []
+    homes = {}   # tag -> set of drawings where it is labelled >=2 times (its home)
     with fitz.open(pdf_path) as doc:
         for page in doc:
-            text = page.get_text("text")
             dwg = drawing_number(page) or f"(page {page.number + 1})"
-            found = extract_page(text, ref["codes"])
-            for tag in sorted(found["Equipment"]):
-                if tag not in ref["equipment"]:
-                    status = "NOT IN MEL"
-                elif tag in declared and declared[tag] != dwg:
-                    # in the MEL, but drawn on a sheet other than its declared P&ID
-                    status = f"P&ID MISMATCH (MEL says {declared[tag]})"
-                else:
-                    status = "IN LIST"
-                rows.append([dwg, "Equipment", tag, names.get(tag, ""), "MEL", status])
-            for tag in sorted(found["Valve"]):
-                ok = tag in ref["valves"]
-                rows.append([dwg, "Valve", tag, "", "Valve List",
-                             "IN LIST" if ok else "NOT IN VALVE LIST"])
-            for tag in sorted(found["Line"]):
-                ok = line_in_list(tag, ref)
-                rows.append([dwg, "Line", tag, "", "Line List",
-                             "IN LIST" if ok else "NOT IN LINE LIST"])
-            for tag in sorted(found["Other"]):
-                # per scope decision: untracked tagged items are discrepancies
-                rows.append([dwg, "Other", tag, "", "MEL", "NOT IN MEL (untracked type)"])
+            valves, lines, eq_counts, other_counts = page_tags(
+                page.get_text("text"), ref["codes"])
+            pages.append((dwg, valves, lines, eq_counts, other_counts))
+            for tag, c in (eq_counts | other_counts).items():
+                if c >= 2:
+                    homes.setdefault(tag, set()).add(dwg)
 
-    df = pd.DataFrame(rows, columns=["P&ID", "Category", "Tag", "Description",
-                                     "Checked Against", "Status"])
-    disc = df[df["Status"] != "IN LIST"].reset_index(drop=True)
+    # ---- pass 2: build rows ---------------------------------------------
+    rows = []
+    for dwg, valves, lines, eq_counts, other_counts in pages:
+        for tag in sorted(eq_counts):
+            note = ""
+            if eq_counts[tag] < 2:
+                if tag in homes:
+                    continue            # cross-reference; real home captured elsewhere
+                note = ONLY_ONCE        # never labelled twice anywhere -> flag for review
+            if tag not in ref["equipment"]:
+                status = "NOT IN MEL"
+            elif tag in declared and declared[tag] != dwg:
+                status = f"P&ID MISMATCH (MEL says {declared[tag]})"
+            else:
+                status = "IN LIST"
+            rows.append([dwg, "Equipment", tag, "MEL", status, note])
+        for tag in sorted(other_counts):
+            note = ""
+            if other_counts[tag] < 2:
+                if tag in homes:
+                    continue
+                note = ONLY_ONCE
+            rows.append([dwg, "Other", tag, "MEL", "NOT IN MEL (untracked type)", note])
+        for tag in sorted(valves):
+            ok = tag in ref["valves"]
+            rows.append([dwg, "Valve", tag, "Valve List",
+                         "IN LIST" if ok else "NOT IN VALVE LIST", ""])
+        for tag in sorted(lines):
+            ok = line_in_list(tag, ref)
+            rows.append([dwg, "Line", tag, "Line List",
+                         "IN LIST" if ok else "NOT IN LINE LIST", ""])
+
+    df = pd.DataFrame(rows, columns=["P&ID", "Category", "Tag",
+                                     "Checked Against", "Status", "Notes"])
+    # an item needs attention if it isn't cleanly in its list, or carries a note
+    disc = df[(df["Status"] != "IN LIST") | (df["Notes"] != "")].reset_index(drop=True)
     summary = pd.DataFrame({
         "Metric": ["P&ID pages", "Equipment found", "Valves found", "Lines found",
-                   "Other tagged items", "DISCREPANCIES (on P&ID, not in list)"],
+                   "Other tagged items", "Labelled once (verify)",
+                   "DISCREPANCIES / items to review"],
         "Value": [df["P&ID"].nunique(),
                   int((df.Category == "Equipment").sum()),
                   int((df.Category == "Valve").sum()),
                   int((df.Category == "Line").sum()),
                   int((df.Category == "Other").sum()),
+                  int((df.Notes != "").sum()),
                   len(disc)],
     })
     return df, disc, summary
