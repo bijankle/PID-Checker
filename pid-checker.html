@@ -223,7 +223,7 @@ async function pdfPages(file){
     const corner=fps.filter(it=>it.x>0.6*W&&it.y<0.15*H);   // bottom-right title block (y is bottom-origin)
     const pool=corner.length?corner:fps;
     pool.sort((a,b)=>a.y-b.y||b.x-a.x);
-    out.push({dwg:pool.length?pool[0].str.trim():"(unknown)",H,W,items,text});
+    out.push({num:i,dwg:pool.length?pool[0].str.trim():"(unknown)",H,W,items,text});
   }
   return out;
 }
@@ -271,7 +271,9 @@ function pageTags(text,codes){
 // ---------- analysis ----------
 async function analyze(){
   const ref=await buildReferences();
-  const pages=await pdfPages(store.pdf.file);
+  const allPages=await pdfPages(store.pdf.file);
+  const manualPages=[], pages=[];
+  for(const pg of allPages){ if((pg.text||"").trim().length<20) manualPages.push(pg.num); else pages.push(pg); }
   const homes={};
   for(const pg of pages){Object.assign(pg, pageTags(pg.text,ref.codes));
     pg.desc=store.mel?descriptions(pg.items,pg.H):{}; pg.vp=valvePairs(pg.items,pg.W);
@@ -318,24 +320,27 @@ async function analyze(){
       ln.rows.push([[...g.tags].sort().join(" / "),listNo,pp.join(", "),lp.join(", "),note]);
       ln.mask.push([0,!matched,bad,bad,!!note]);}
   }
-  // Continuations: verify each border ribbon's target drawing carries the line
+  // Continuations: strict — the ribbon's named drawing must carry that exact
+  // line (fluid+sequential). Line No (to) is the line as found on the target.
   const linesOn={}, allDwgs=new Set();
-  for(const pg of pages){allDwgs.add(pg.dwg);const s=linesOn[pg.dwg]=linesOn[pg.dwg]||new Set();
-    for(const tag of pg.lines){const m=tag.match(/(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})/);s.add(m[2]+"|"+String(parseInt(m[4],10)));}}
-  const ct={cols:["On Sheet","Ribbon → Drawing","Line No","Status"],rows:[],mask:[]};
+  for(const pg of pages){allDwgs.add(pg.dwg);const d=linesOn[pg.dwg]=linesOn[pg.dwg]||{};
+    for(const tag of pg.lines){const m=tag.match(/(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})/);const k=m[2]+"|"+String(parseInt(m[4],10));if(!(k in d))d[k]=tag;}}
+  const ct={cols:["Line No (from)","Line No (to)","P&ID (from)","P&ID (to)","Status"],rows:[],mask:[]};
   for(const pg of pages)for(const [tgt,lt] of (pg.ribbons||[])){
     const m=lt.match(/(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})/);const k=m[2]+"|"+String(parseInt(m[4],10));
-    let status,bad;
-    if(!allDwgs.has(tgt)){status="target drawing not in this set";bad=false;}
-    else if(linesOn[tgt]&&linesOn[tgt].has(k)){status="OK";bad=false;}
-    else{status="LINE NOT FOUND ON TARGET DRAWING";bad=true;}
-    ct.rows.push([pg.dwg,tgt,lt,status]);ct.mask.push([0,bad,bad,bad]);}
+    if(!allDwgs.has(tgt)){ct.rows.push([lt,"",pg.dwg,tgt,"target drawing not in uploaded set"]);ct.mask.push([0,0,0,0,0]);}
+    else if(linesOn[tgt]&&(k in linesOn[tgt])){ct.rows.push([lt,linesOn[tgt][k],pg.dwg,tgt,"OK"]);ct.mask.push([0,0,0,0,0]);}
+    else{ct.rows.push([lt,"",pg.dwg,tgt,"line not found on named P&ID"]);ct.mask.push([0,1,0,1,1]);}}
 
-  const tables={Equipment:eq,Valves:vl,Lines:ln,Continuations:ct,Other:ot};
+  const mr={cols:["Sheet","Issue"],
+    rows:manualPages.map(n=>["page "+n,"No readable text on this sheet — check the P&ID number and contents manually"]),
+    mask:manualPages.map(()=>[1,1])};
+
+  const tables={Equipment:eq,Valves:vl,Lines:ln,Continuations:ct,Other:ot,"Manual Review":mr};
   const review=Object.values(tables).reduce((n,t)=>n+t.mask.filter(m=>m.some(Boolean)).length,0);
   const summary=[["P&ID pages",new Set(pages.map(p=>p.dwg)).size],["Equipment found",eq.rows.length],
     ["Valves found",vl.rows.length],["Lines found",ln.rows.length],["Other tagged items",ot.rows.length],
-    ["Rows needing review",review]];
+    ["Sheets needing manual check",manualPages.length],["Rows needing review",review]];
   return {tables,summary,review};
 }
 
@@ -358,8 +363,9 @@ const SEC={
   Equipment:{title:"Equipment",sub:"PID equipment no. vs MEL — and PID description vs MEL description."},
   Valves:{title:"Valves",sub:"Unique VV tag and its sized code, drawing vs valve list."},
   Lines:{title:"Lines",sub:"Grouped by service + sequential (reducers / spec breaks are one line). Drawing P&IDs vs line-list P&ID."},
-  Continuations:{title:"Continuations",sub:"Each off-page ribbon's target drawing is checked to actually carry that line."},
+  Continuations:{title:"Continuations",sub:"Off-page ribbon line (from) vs the line found on the named target drawing (to). Flagged when the named P&ID doesn't carry that exact line."},
   Other:{title:"Other tags (not in the MEL)",sub:"Cameras, stockpiles and similar items tagged on a drawing but not tracked in the MEL."},
+  "Manual Review":{title:"Manual review",sub:"Sheets with no readable text (scanned, or text saved as outlines) — check these P&IDs by hand."},
 };
 function render(res){
   const r=res.review;
@@ -370,7 +376,7 @@ function render(res){
   </div>
   <p class="legend"><span class="chip"></span>Highlighted cells disagree between the drawing and the list.</p>`;
 
-  for(const name of ["Equipment","Valves","Lines","Continuations","Other"]){
+  for(const name of ["Equipment","Valves","Lines","Continuations","Other","Manual Review"]){
     const t=res.tables[name]; if(!t.rows.length) continue;
     html+=`<h2 class="sec">${SEC[name].title} <span style="color:var(--muted);font-weight:600;font-size:14px;">· ${t.rows.length}</span></h2>`;
     html+=`<p class="sec-sub">${SEC[name].sub}</p>`;
@@ -381,7 +387,8 @@ function render(res){
 }
 function tableHtml(t){
   const tagCols=new Set(["PID Equip No","MEL Equip No","PID Valve Tag","List Valve Tag",
-    "PID Size Code","List Size Code","PID Line No","List Line No","PID P&IDs","List P&ID","P&ID","Tag"]);
+    "PID Size Code","List Size Code","PID Line No","List Line No","PID P&IDs","List P&ID","P&ID","Tag",
+    "Line No (from)","Line No (to)","P&ID (from)","P&ID (to)","Sheet","Ribbon → Drawing"]);
   let h="<table><thead><tr>"+t.cols.map(c=>`<th>${esc(c)}</th>`).join("")+"</tr></thead><tbody>";
   t.rows.forEach((row,ri)=>{
     h+="<tr>"+row.map((c,ci)=>{
@@ -398,7 +405,7 @@ async function downloadExcel(){
   const red={type:"pattern",pattern:"solid",fgColor:{argb:"FFFCEDED"}};
   const sw=wb.addWorksheet("Summary"); sw.addRow(["Metric","Value"]); sw.getRow(1).font={bold:true};
   RESULT.summary.forEach(r=>sw.addRow(r));
-  for(const name of ["Equipment","Valves","Lines","Continuations","Other"]){
+  for(const name of ["Equipment","Valves","Lines","Continuations","Other","Manual Review"]){
     const t=RESULT.tables[name]; const ws=wb.addWorksheet(name);
     ws.addRow(t.cols); ws.getRow(1).font={bold:true};
     t.rows.forEach((row,ri)=>{const xr=ws.addRow(row);

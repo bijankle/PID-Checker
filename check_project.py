@@ -70,7 +70,10 @@ def descriptions_match(pid_desc, mel_desc):
 # page view: words + lines + text, from the native text layer, falling back to
 # OCR for sheets that have no extractable text (scanned, or text-as-outlines).
 # --------------------------------------------------------------------------
-def _native_view(page):
+def page_view(page):
+    """Words + lines + text from the native text layer. Sheets with no
+    extractable text (scanned, or text saved as vector outlines) come back
+    empty and are surfaced for manual review rather than OCR'd."""
     lines = []
     for b in page.get_text("dict")["blocks"]:
         for l in b.get("lines", []):
@@ -80,46 +83,7 @@ def _native_view(page):
                 lines.append((x0, y0, x1, y1, txt))
     return {"W": page.rect.width, "H": page.rect.height,
             "words": [tuple(w[:5]) for w in page.get_text("words")],
-            "lines": lines, "text": page.get_text("text"), "ocr": False}
-
-
-def _ocr_view(page, dpi=300):
-    import io
-    import pytesseract
-    from PIL import Image
-    pix = page.get_pixmap(dpi=dpi)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-    sc = 72.0 / dpi
-    words, lmap = [], {}
-    for i in range(len(data["text"])):
-        t = data["text"][i].strip()
-        if not t:
-            continue
-        x0, y0 = data["left"][i] * sc, data["top"][i] * sc
-        x1 = (data["left"][i] + data["width"][i]) * sc
-        y1 = (data["top"][i] + data["height"][i]) * sc
-        words.append((x0, y0, x1, y1, t))
-        lmap.setdefault((data["block_num"][i], data["par_num"][i], data["line_num"][i]), []).append((x0, y0, x1, y1, t))
-    lines = []
-    for wl in lmap.values():
-        wl.sort(key=lambda z: z[0])
-        lines.append((min(w[0] for w in wl), min(w[1] for w in wl),
-                      max(w[2] for w in wl), max(w[3] for w in wl),
-                      " ".join(w[4] for w in wl)))
-    return {"W": page.rect.width, "H": page.rect.height, "words": words,
-            "lines": lines, "text": "\n".join(w[4] for w in words), "ocr": True}
-
-
-def page_view(page, ocr_threshold=20):
-    nv = _native_view(page)
-    if len(nv["text"].strip()) >= ocr_threshold:
-        return nv
-    try:
-        ov = _ocr_view(page)
-        return ov if ov["words"] else nv
-    except Exception:
-        return nv   # OCR unavailable (no tesseract) — return the empty native view
+            "lines": lines, "text": page.get_text("text")}
 
 
 # --------------------------------------------------------------------------
@@ -350,10 +314,13 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
     declared, names = ref["declared_pid"], ref["names"]
 
     # ---- pass 1: read every page ----
-    pages, homes = [], {}
+    pages, homes, manual_pages = [], {}, []
     with fitz.open(pdf_path) as doc:
         for page in doc:
             pv = page_view(page)
+            if len(pv["text"].strip()) < 20:        # no readable text -> manual check
+                manual_pages.append(page.number + 1)
+                continue
             dwg = drawing_number(pv) or f"(page {page.number + 1})"
             valves, vvs, lines, eq_counts, other_counts = page_tags(pv["text"], ref["codes"])
             pages.append({
@@ -362,7 +329,6 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
                 "desc": equipment_descriptions(pv),
                 "vpairs": valve_pairs(pv),
                 "ribbons": continuation_ribbons(pv),
-                "ocr": pv["ocr"],
             })
             for tag, c in (eq_counts | other_counts).items():
                 if c >= 2:
@@ -375,26 +341,23 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
 
     # ---- pass 2 ----
     for pg in pages:
-        ocr = pg.get("ocr")
-        dwg = pg["dwg"] + (" (OCR)" if ocr else "")
+        dwg = pg["dwg"]
 
         # Equipment: PID no | MEL no | PID descr | MEL descr | Notes
-        # On OCR'd sheets the drawing number and descriptions are unreliable, so
-        # we recover the tags but suppress the P&ID / description mismatch flags.
         for tag in sorted(pg["eq"]):
-            note = "read via OCR — verify" if ocr else ""
+            note = ""
             if pg["eq"][tag] < 2:
                 if tag in homes:
                     continue
-                note = (note + "; " if note else "") + ONLY_ONCE
+                note = ONLY_ONCE
             in_mel = tag in ref["equipment"]
             if not in_mel:
                 note = (note + "; " if note else "") + "not in MEL"
-            elif (not ocr) and tag in declared and declared[tag] != pg["dwg"]:
+            elif tag in declared and declared[tag] != dwg:
                 note = (note + "; " if note else "") + f"MEL P&ID = {declared[tag]}"
             pid_desc = pg["desc"].get(tag, "")
             mel_desc = names.get(tag, "")
-            desc_bad = (not ocr and in_mel and _desc_reliable(pid_desc) and bool(mel_desc)
+            desc_bad = (in_mel and _desc_reliable(pid_desc) and bool(mel_desc)
                         and not descriptions_match(pid_desc, mel_desc))
             eq_rows.append([dwg, tag, tag if in_mel else "", pid_desc, mel_desc, note])
             eq_mask.append([False, False, not in_mel, desc_bad, desc_bad, bool(note)])
@@ -441,32 +404,39 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
                         ", ".join(pid_pids), ", ".join(list_pids), note])
         ln_mask.append([False, not matched, pids_bad, pids_bad, bool(note)])
 
-    # Continuations: verify each off-page ribbon points to a drawing that
-    # actually carries that line (by service + sequential).
+    # Continuations: each off-page ribbon (on a sheet, naming a target drawing
+    # and a line) is checked strictly — the named drawing must carry that exact
+    # line (fluid service + sequential). Line No (to) is the line as found on the
+    # target; a line not on the named drawing is flagged (wrong P&ID / renumber).
     all_dwgs = {pg["dwg"] for pg in pages}
     lines_on = {}
     for pg in pages:
-        s = lines_on.setdefault(pg["dwg"], set())
+        d = lines_on.setdefault(pg["dwg"], {})
         for tag in pg["lines"]:
-            s.add(line_key(tag))
+            d.setdefault(line_key(tag), tag)
     ct_rows, ct_mask = [], []
     for pg in pages:
         for tgt, ltag in pg["ribbons"]:
             key = line_key(ltag)
             if tgt not in all_dwgs:
-                status, bad = "target drawing not in this set", False
-            elif key in lines_on.get(tgt, set()):
-                status, bad = "OK", False
+                ct_rows.append([ltag, "", pg["dwg"], tgt, "target drawing not in uploaded set"])
+                ct_mask.append([False, False, False, False, False])
+            elif key in lines_on.get(tgt, {}):
+                ct_rows.append([ltag, lines_on[tgt][key], pg["dwg"], tgt, "OK"])
+                ct_mask.append([False, False, False, False, False])
             else:
-                status, bad = "LINE NOT FOUND ON TARGET DRAWING", True
-            ct_rows.append([pg["dwg"], tgt, ltag, status])
-            ct_mask.append([False, bad, bad, bad])
+                ct_rows.append([ltag, "", pg["dwg"], tgt, "line not found on named P&ID"])
+                ct_mask.append([False, True, False, True, True])
+
+    mr_rows = [[f"page {n}", "No readable text on this sheet — check the P&ID number "
+                "and contents manually"] for n in manual_pages]
 
     eq_cols = ["P&ID", "PID Equip No", "MEL Equip No", "PID Description", "MEL Description", "Notes"]
     vl_cols = ["P&ID", "PID Valve Tag", "List Valve Tag", "PID Size Code", "List Size Code", "Notes"]
     ln_cols = ["PID Line No", "List Line No", "PID P&IDs", "List P&ID", "Notes"]
     ot_cols = ["P&ID", "Tag", "Status", "Notes"]
-    ct_cols = ["On Sheet", "Ribbon → Drawing", "Line No", "Status"]
+    ct_cols = ["Line No (from)", "Line No (to)", "P&ID (from)", "P&ID (to)", "Status"]
+    mr_cols = ["Sheet", "Issue"]
 
     tables = {
         "Equipment": pd.DataFrame(eq_rows, columns=eq_cols),
@@ -474,6 +444,7 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
         "Lines":     pd.DataFrame(ln_rows, columns=ln_cols),
         "Continuations": pd.DataFrame(ct_rows, columns=ct_cols),
         "Other":     pd.DataFrame(ot_rows, columns=ot_cols),
+        "Manual Review": pd.DataFrame(mr_rows, columns=mr_cols),
     }
     masks = {
         "Equipment": pd.DataFrame(eq_mask, columns=eq_cols),
@@ -481,15 +452,18 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
         "Lines":     pd.DataFrame(ln_mask, columns=ln_cols),
         "Continuations": pd.DataFrame(ct_mask, columns=ct_cols),
         "Other":     pd.DataFrame([[False] * len(ot_cols) for _ in ot_rows], columns=ot_cols),
+        "Manual Review": pd.DataFrame([[True, True] for _ in mr_rows], columns=mr_cols),
     }
+    bad_ct = int(pd.DataFrame(ct_mask).any(axis=1).sum()) if ct_mask else 0
     flagged = sum(int(m.any(axis=1).sum()) for m in masks.values()) + len(ot_rows)
     summary = pd.DataFrame({
         "Metric": ["P&ID pages", "Equipment found", "Valves found", "Lines found",
                    "Continuations checked", "Bad continuations",
-                   "Other tagged items", "Rows needing review"],
+                   "Other tagged items", "Sheets needing manual check",
+                   "Rows needing review"],
         "Value": [len({p["dwg"] for p in pages}), len(eq_rows), len(vl_rows),
-                  len(ln_rows), len(ct_rows), int((pd.DataFrame(ct_mask).any(axis=1)).sum()) if ct_mask else 0,
-                  len(ot_rows), flagged],
+                  len(ln_rows), len(ct_rows), bad_ct,
+                  len(ot_rows), len(mr_rows), flagged],
     })
     return {"tables": tables, "masks": masks, "summary": summary}
 
@@ -500,7 +474,7 @@ def write_report(result, out_path):
     red = PatternFill("solid", fgColor="FFC7CE")
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         result["summary"].to_excel(xw, sheet_name="Summary", index=False)
-        for name in ("Equipment", "Valves", "Lines", "Continuations", "Other"):
+        for name in ("Equipment", "Valves", "Lines", "Continuations", "Other", "Manual Review"):
             df = result["tables"][name]
             df.to_excel(xw, sheet_name=name, index=False)
             mask = result["masks"][name]
