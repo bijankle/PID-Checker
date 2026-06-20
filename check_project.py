@@ -203,36 +203,36 @@ def load_references(line_path, valve_path, mel_path):
             pass
     valves = {v for v in valves if v and v not in {"NAN", "-", "SPARE"}}
 
-    # Lines: existence keys + which P&ID(s) the list assigns each line to.
+    # Lines are identified by SERVICE + SEQUENTIAL only; size and spec may change
+    # along a line (reducers / spec breaks) and it is still the same line. We key
+    # everything on (service, sequential) and record which P&ID(s) the list
+    # assigns each line to, plus the list's own line identifier.
     ll = pd.read_excel(line_path, sheet_name="Line List", header=0, dtype=str).iloc[1:]
-    serv_num, serv_spec_num, line_pid = set(), set(), {}
+    serv_num, line_pid, line_ident = set(), {}, {}
     pidc = _find_col(ll.columns, "P&ID", "PID")
-
-    def add(serv, spec, num, pids):
-        serv = str(serv).strip().upper()
-        num = re.sub(r"\D", "", str(num))
-        if not serv or not num:
-            return
-        num = str(int(num))
-        serv_num.add((serv, num))
-        line_pid.setdefault((serv, num), set()).update(pids)
-        for sp in re.split(r"[\s/\n]+", str(spec).upper()):
-            if sp.strip() and sp != "NAN":
-                serv_spec_num.add((serv, sp.strip(), num))
-                line_pid.setdefault((serv, sp.strip(), num), set()).update(pids)
+    ident_col = _find_col(ll.columns, "Identifier")
 
     for _, r in ll.iterrows():
         pids = set(RE_DWG.findall(str(r.get(pidc)).upper())) if pidc else set()
-        add(r.get("SERV CODE"), r.get("SPEC"), r.get("LINE No."), pids)
-        for c in ll.columns:
+        serv = str(r.get("SERV CODE")).strip().upper()
+        num = re.sub(r"\D", "", str(r.get("LINE No.")))
+        if serv and num:
+            key = (serv, str(int(num)))
+            serv_num.add(key)
+            line_pid.setdefault(key, set()).update(pids)
+            ident = str(r.get(ident_col)).strip() if ident_col else ""
+            if ident and ident.lower() != "nan":
+                line_ident.setdefault(key, ident)
+        for c in ll.columns:   # harvest fully-written line numbers in any cell
             for m in RE_LINE.finditer(str(r.get(c)).upper()):
-                serv_num.add((m.group(2), str(int(m.group(4)))))
-                serv_spec_num.add((m.group(2), m.group(3), str(int(m.group(4)))))
+                k = (m.group(2), str(int(m.group(4))))
+                serv_num.add(k)
+                line_pid.setdefault(k, set())
 
     return {"equipment": equipment, "codes": codes, "valves": valves,
-            "vv_set": vv_set, "vv_to_size": vv_to_size,
-            "serv_num": serv_num, "serv_spec_num": serv_spec_num,
-            "line_pid": line_pid, "declared_pid": declared_pid, "names": names}
+            "vv_set": vv_set, "vv_to_size": vv_to_size, "serv_num": serv_num,
+            "line_pid": line_pid, "line_ident": line_ident,
+            "declared_pid": declared_pid, "names": names}
 
 
 def page_tags(text, codes):
@@ -255,16 +255,14 @@ def page_tags(text, codes):
     return valves, vvs, lines, eq_counts, other_counts
 
 
+def line_key(tag):
+    """A line's identity = (service, sequential)."""
+    m = RE_LINE.fullmatch(tag)
+    return (m.group(2), str(int(m.group(4))))
+
+
 def line_in_list(tag, ref):
-    m = RE_LINE.fullmatch(tag)
-    s, sp, n = m.group(2), m.group(3), str(int(m.group(4)))
-    return (s, sp, n) in ref["serv_spec_num"] or (s, n) in ref["serv_num"]
-
-
-def _line_pids(tag, ref):
-    m = RE_LINE.fullmatch(tag)
-    s, sp, n = m.group(2), m.group(3), str(int(m.group(4)))
-    return ref["line_pid"].get((s, sp, n)) or ref["line_pid"].get((s, n)) or set()
+    return line_key(tag) in ref["serv_num"]
 
 
 # --------------------------------------------------------------------------
@@ -337,21 +335,33 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
             vl_rows.append([dwg, vv, vv if in_list else "", pid_size, list_size, note])
             vl_mask.append([False, False, not in_list, size_bad, size_bad, bool(note)])
 
-        # Lines: PID no | list no | list P&ID | sheet found on | Notes
-        for tag in sorted(pg["lines"]):
-            ok = line_in_list(tag, ref)
-            pids = _line_pids(tag, ref)
-            on_listed_pid = (not pids) or (dwg in pids)
-            note = "" if ok else "not in line list"
-            if ok and pids and not on_listed_pid:
-                note = "drawn on a sheet not in the line-list P&ID"
-            ln_rows.append([dwg, tag, tag if ok else "",
-                            ", ".join(sorted(pids)), dwg, note])
-            ln_mask.append([False, False, not ok, not on_listed_pid, not on_listed_pid, bool(note)])
+    # Lines are grouped across the whole document by (service, sequential), so a
+    # continuation line spanning two sheets is one row capturing both P&IDs.
+    line_groups = {}   # (serv, seq) -> {"tags": set, "pids": set}
+    for pg in pages:
+        for tag in pg["lines"]:
+            g = line_groups.setdefault(line_key(tag), {"tags": set(), "pids": set()})
+            g["tags"].add(tag)
+            g["pids"].add(pg["dwg"])
+    for key in sorted(line_groups):
+        g = line_groups[key]
+        matched = key in ref["serv_num"]
+        list_no = ref["line_ident"].get(key, "") if matched else ""
+        if matched and not list_no:
+            list_no = key[0] + key[1]
+        pid_pids = sorted(g["pids"])
+        list_pids = sorted(ref["line_pid"].get(key, set()))
+        # red only if the line is drawn on a sheet the line-list P&ID doesn't include
+        pids_bad = matched and bool(list_pids) and not set(pid_pids).issubset(set(list_pids))
+        note = "not in line list" if not matched else (
+            "drawn on a P&ID not in the line list" if pids_bad else "")
+        ln_rows.append([" / ".join(sorted(g["tags"])), list_no,
+                        ", ".join(pid_pids), ", ".join(list_pids), note])
+        ln_mask.append([False, not matched, pids_bad, pids_bad, bool(note)])
 
     eq_cols = ["P&ID", "PID Equip No", "MEL Equip No", "PID Description", "MEL Description", "Notes"]
     vl_cols = ["P&ID", "PID Valve Tag", "List Valve Tag", "PID Size Code", "List Size Code", "Notes"]
-    ln_cols = ["P&ID (found on)", "PID Line No", "List Line No", "List P&ID", "Sheet Found On", "Notes"]
+    ln_cols = ["PID Line No", "List Line No", "PID P&IDs", "List P&ID", "Notes"]
     ot_cols = ["P&ID", "Tag", "Status", "Notes"]
 
     tables = {

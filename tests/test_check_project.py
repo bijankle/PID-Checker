@@ -72,7 +72,7 @@ def _make_lists(tmp_path):
     line = tmp_path / "line.xlsx"
     pd.DataFrame([
         ["sub", "", "", "", ""],
-        ["", "PW", "S31", "027", "120-FP-001"],   # zero-padded; P&ID matches the sheet
+        ["PW27", "PW", "S31", "027", "120-FP-001"],   # zero-padded; P&ID matches the sheet
     ], columns=["Identifier", "SERV CODE", "SPEC", "LINE No.", "P&ID"]).to_excel(
         line, sheet_name="Line List", index=False)
     return line, valve, mel
@@ -115,10 +115,12 @@ def test_analyze(tmp_path):
     assert v["List Valve Tag"] == "120-VV-003"
     assert v["PID Size Code"] == "25V41A" and v["List Size Code"] == "25V41A"
 
-    # --- Lines: side-by-side + list P&ID ---
+    # --- Lines: grouped by service+sequential, Line|Line|P&ID|P&ID order ---
+    assert list(ln.columns) == ["PID Line No", "List Line No", "PID P&IDs",
+                                "List P&ID", "Notes"]
     li = _row(ln, "PID Line No", "25-PW-S31-027")
-    assert li["List Line No"] == "25-PW-S31-027"
-    assert "120-FP-001" in li["List P&ID"]
+    assert li["List Line No"] == "PW27"          # the line-list identifier
+    assert "120-FP-001" in li["PID P&IDs"] and "120-FP-001" in li["List P&ID"]
 
 
 if __name__ == "__main__":
