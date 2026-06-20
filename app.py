@@ -1,26 +1,22 @@
 """
 PID-Checker web app.
 
-Upload a P&ID PDF plus any of the engineering lists (line / valve / tie-in /
-equipment). The app extracts each page's drawing number and tags, reconciles the
-lists against the drawings, and shows an inconsistency report with a downloadable
-Excel version.
+Drag-and-drop the four project files — P&ID PDF, Line List, Valve List, MEL —
+and get the consistency report in the browser plus a downloadable Excel.
+
+The analysis itself lives in check_project.py (shared with the command-line
+version) so the web app and the script always agree.
 """
 from __future__ import annotations
 
 import os
-import tempfile
 import uuid
 
 from flask import (Flask, render_template, request, send_file, redirect,
                    url_for, flash)
 from werkzeug.utils import secure_filename
 
-import config
-from pidchecker.pdf_extractor import extract_pdf
-from pidchecker.excel_loader import load_list
-from pidchecker.reconciler import reconcile, summarize
-from pidchecker.report import write_excel, findings_to_dataframe
+from check_project import analyze, write_report
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
@@ -30,70 +26,62 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("PIDCHECKER_SECRET", "dev-secret-change-me")
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB total upload
 
-# In-memory store of generated reports (path) keyed by run id. Fine for a
-# single-process local tool; swap for a store if this is ever scaled out.
+# Remembers the most recent report per run so the Download button works.
 _REPORTS: dict[str, str] = {}
 
-
-def _classify(filename: str) -> str | None:
-    name = filename.lower()
-    for schema, hints in config.FILENAME_HINTS.items():
-        if any(h in name for h in hints):
-            return schema
-    return None
+REQUIRED = {
+    "pid_pdf": "P&ID PDF",
+    "line_list": "Line List",
+    "valve_list": "Valve List",
+    "mel": "Mechanical Equipment List (MEL)",
+}
 
 
 @app.route("/")
 def index():
-    return render_template("index.html", schemas=config.LIST_SCHEMAS)
+    return render_template("index.html")
 
 
 @app.route("/check", methods=["POST"])
 def check():
-    pdf = request.files.get("pid_pdf")
-    if not pdf or not pdf.filename:
-        flash("Please upload a P&ID PDF.")
+    # All four files are needed for a full reconciliation.
+    missing = [label for field, label in REQUIRED.items()
+               if not request.files.get(field) or not request.files[field].filename]
+    if missing:
+        flash("Please upload: " + ", ".join(missing))
         return redirect(url_for("index"))
 
     workdir = os.path.join(UPLOAD_DIR, uuid.uuid4().hex)
     os.makedirs(workdir, exist_ok=True)
 
-    pdf_path = os.path.join(workdir, secure_filename(pdf.filename))
-    pdf.save(pdf_path)
-    pages = extract_pdf(pdf_path)
+    paths = {}
+    for field in REQUIRED:
+        f = request.files[field]
+        p = os.path.join(workdir, secure_filename(f.filename))
+        f.save(p)
+        paths[field] = p
 
-    lists = []
-    for field_name in ("line_list", "valve_list", "tie_in_list", "equipment_list"):
-        f = request.files.get(field_name)
-        if not f or not f.filename:
-            continue
-        # explicit field overrides filename-based classification
-        schema = field_name if field_name in config.LIST_SCHEMAS else _classify(f.filename)
-        if not schema:
-            continue
-        list_path = os.path.join(workdir, secure_filename(f.filename))
-        f.save(list_path)
-        try:
-            lists.append(load_list(list_path, schema))
-        except Exception as exc:  # noqa: BLE001 - surface load errors in report
-            flash(f"Could not read {f.filename}: {exc}")
-
-    findings = reconcile(lists, pages)
-    summary = summarize(findings)
+    try:
+        df, disc, summary = analyze(
+            paths["pid_pdf"], paths["line_list"],
+            paths["valve_list"], paths["mel"],
+        )
+    except Exception as exc:  # noqa: BLE001 - show the problem to the user
+        flash(f"Could not analyse the files: {exc}")
+        return redirect(url_for("index"))
 
     run_id = uuid.uuid4().hex
-    report_path = os.path.join(workdir, "pid_check_report.xlsx")
-    write_excel(findings, summary, report_path)
+    report_path = os.path.join(workdir, "PID_Check_Report.xlsx")
+    write_report(df, disc, summary, report_path)
     _REPORTS[run_id] = report_path
 
-    df = findings_to_dataframe(findings)
+    summary_dict = dict(zip(summary["Metric"], summary["Value"]))
     return render_template(
         "report.html",
         run_id=run_id,
-        summary=summary,
-        findings=df.to_dict(orient="records"),
-        pages=pages,
-        lists=lists,
+        summary=summary_dict,
+        discrepancies=disc.to_dict(orient="records"),
+        inventory=df.to_dict(orient="records"),
     )
 
 
@@ -104,7 +92,7 @@ def download(run_id: str):
         flash("Report no longer available; please re-run the check.")
         return redirect(url_for("index"))
     return send_file(path, as_attachment=True,
-                     download_name="pid_check_report.xlsx")
+                     download_name="PID_Check_Report.xlsx")
 
 
 if __name__ == "__main__":

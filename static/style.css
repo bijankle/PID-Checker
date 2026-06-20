@@ -33,3 +33,4 @@ th { background: #f0f3f6; }
 .context { margin: 1rem 0; }
 .context summary { cursor: pointer; font-weight: 600; }
 .ok { color: var(--ok); font-size: 1.1rem; }
+tr.row-bad td { background: #fdecea; }

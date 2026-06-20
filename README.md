@@ -1,88 +1,77 @@
 # PID-Checker
 
-A web app that reconciles **P&ID drawings** against engineering **lists**
-(line list, valve list, tie-in list, mechanical equipment list, …) and flags
-inconsistencies between them.
+A small web app that checks **P&ID drawings** against the project's engineering
+lists and flags anything that appears on a drawing but is **missing from the
+matching list**.
 
-For every page of the P&ID PDF it:
+It reads every tag off the P&ID PDF and reconciles:
 
-1. reads the **drawing / P&ID number** from the title block (falling back to a
-   full-page scan), and
-2. finds every **line / valve / tie-in / equipment** tag on the page,
+- **Equipment** (`AREA-TYPE-NNN`, e.g. `121-CV-014`) against the **MEL**
+- **Valves** (sized `50V11A` and pattern `120-VV-003`) against the **Valve List**
+- **Lines** (`SIZE-SERV-SPEC-NNN`, e.g. `25-PW-S31-027`) against the **Line List**
 
-then attributes each tag to its drawing and cross-checks against the lists.
+Anything tagged on a drawing whose type isn't tracked (e.g. CCTV cameras `CA`)
+is also reported as a discrepancy.
 
-## What it flags
+## How to run the web app (the easy way)
 
-| Category | Meaning | Severity |
-|---|---|---|
-| `in_list_not_on_pid` | Item is in a list but on no drawing | error |
-| `on_pid_not_in_list` | Tag is on a drawing but missing from its list | error |
-| `wrong_declared_drawing` | List names a P&ID, but item is on a different one | error |
-| `duplicate_in_list` | Same identifier appears twice in one list | warning |
-| `missing_drawing_number` | A page's title block yielded no number | warning |
-| `on_multiple_drawings` | Tag appears on several drawings (often fine) | info |
+You need this **one-time setup**:
 
-Results are shown in the browser and downloadable as an Excel report
-(Summary + Findings sheets).
+1. **Install Python** from https://www.python.org/downloads/ (tick *"Add Python
+   to PATH"* during install).
+2. Open a terminal **in this project folder**:
+   - Windows: type `cmd` in the folder's address bar and press Enter.
+   - Mac: right-click the folder → *New Terminal at Folder*.
+3. Install the libraries it needs (once):
+   ```
+   pip install -r requirements.txt
+   ```
 
-## Running it
+Then, **every time you want to use it**:
 
-```bash
-pip install -r requirements.txt
+```
 python app.py
-# open http://127.0.0.1:5000
 ```
 
-Upload a P&ID PDF (required) plus any of the lists you have.
+You'll see a line like `Running on http://127.0.0.1:5000`. Open that address in
+your web browser, **drag in the four files** (P&ID PDF, Line List, Valve List,
+MEL), and click **Run consistency check**. You get the results on screen and a
+**Download Excel report** button. Press `Ctrl+C` in the terminal to stop it.
 
-### OCR (optional)
+## Prefer the command line?
 
-P&IDs that are native/vector PDFs are read directly — no OCR needed. Scanned
-pages fall back to OCR, which requires the **tesseract** binary in addition to
-the Python packages:
+The same analysis is also a script. Order of files: PDF, Line List, Valve List,
+MEL, then the report name to create:
 
-```bash
-# Debian/Ubuntu
-sudo apt-get install tesseract-ocr
-# macOS
-brew install tesseract
+```
+python check_project.py PID.pdf Line_List.xlsx Valve_List.xlsx MEL.xlsx report.xlsx
 ```
 
-If tesseract is absent, scanned pages are simply reported as un-OCR'd rather
-than failing.
+## What the report contains
 
-## Calibrating to your documents
+- **Summary** — counts of equipment / valves / lines found and total discrepancies.
+- **Discrepancies** — the items on a P&ID that are missing from a list (the point).
+- **Full PID Inventory** — every tag found, so you can confirm nothing was missed.
 
-Everything format-specific lives in **`config.py`**:
+## Adjusting it to other projects
 
-- `TITLE_BLOCK` — region of the page searched for the drawing number.
-- `DRAWING_NUMBER_PATTERN` / `DRAWING_NUMBER_LABELS` — how the number looks.
-- `TAG_PATTERNS` — regexes for line/valve/tie-in/equipment tags as drawn.
-- `LIST_SCHEMAS` — which spreadsheet columns hold each identifier + attributes.
-
-These ship with broad defaults. Once real sample files are available they get
-tuned to the project's actual conventions.
+The tag formats are calibrated to the 2233 Kathleen Valley drawings. If your
+drawings use different conventions, the patterns live near the top of
+`check_project.py` (and `config.py`) and can be adjusted there.
 
 ## Tests
 
-```bash
-python tests/test_pipeline.py     # or: pytest
+```
+python tests/test_check_project.py
 ```
 
-The test generates a synthetic P&ID + line list and asserts the planted
-inconsistencies are detected.
+Generates tiny synthetic files in the project's tag style and checks that the
+reconciliation flags exactly the planted "on-drawing-but-not-in-list" items.
 
-## Project layout
+## Notes
 
-```
-app.py               Flask web app (upload + report)
-config.py            All format-specific configuration (calibrate here)
-pidchecker/
-  pdf_extractor.py   Per-page drawing number + tag extraction (PyMuPDF, OCR fallback)
-  excel_loader.py    Robust .xls/.xlsx loading with header + column detection
-  reconciler.py      Cross-check engine producing findings
-  report.py          Excel report generation
-templates/, static/  Web UI
-tests/               End-to-end test on synthetic data
+- P&IDs are read as native PDF text (fast, exact). Scanned/raster drawings would
+  need OCR (`tesseract`), which isn't required for native-text PDFs like these.
+- Valves are matched by their physical tag. Instrument/actuated valve loop tags
+  (`YV-`/`SV-` shown as instrument balloons) are out of scope for now.
 ```

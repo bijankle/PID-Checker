@@ -114,7 +114,12 @@ def line_in_list(tag, ref):
     return (s, sp, n) in ref["serv_spec_num"] or (s, n) in ref["serv_num"]
 
 
-def check(pdf_path, line_path, valve_path, mel_path, out_path="PID_Check_Report.xlsx"):
+def analyze(pdf_path, line_path, valve_path, mel_path):
+    """Run the reconciliation and return (full_df, discrepancies_df, summary_df).
+
+    Pure analysis — no files written — so both the CLI and the web app can call
+    it and present the results however they like.
+    """
     ref = load_references(line_path, valve_path, mel_path)
     rows = []
     with fitz.open(pdf_path) as doc:
@@ -141,7 +146,7 @@ def check(pdf_path, line_path, valve_path, mel_path, out_path="PID_Check_Report.
 
     df = pd.DataFrame(rows, columns=["P&ID", "Category", "Tag",
                                      "Checked Against", "Status"])
-    disc = df[df["Status"] != "IN LIST"]
+    disc = df[df["Status"] != "IN LIST"].reset_index(drop=True)
     summary = pd.DataFrame({
         "Metric": ["P&ID pages", "Equipment found", "Valves found", "Lines found",
                    "Other tagged items", "DISCREPANCIES (on P&ID, not in list)"],
@@ -152,10 +157,21 @@ def check(pdf_path, line_path, valve_path, mel_path, out_path="PID_Check_Report.
                   int((df.Category == "Other").sum()),
                   len(disc)],
     })
+    return df, disc, summary
+
+
+def write_report(df, disc, summary, out_path):
+    """Write the three result tables to an Excel workbook."""
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
         summary.to_excel(xw, sheet_name="Summary", index=False)
         disc.to_excel(xw, sheet_name="Discrepancies", index=False)
         df.to_excel(xw, sheet_name="Full PID Inventory", index=False)
+
+
+def check(pdf_path, line_path, valve_path, mel_path, out_path="PID_Check_Report.xlsx"):
+    """CLI convenience: analyze and write the Excel report in one call."""
+    df, disc, summary = analyze(pdf_path, line_path, valve_path, mel_path)
+    write_report(df, disc, summary, out_path)
     print(f"Wrote {out_path}: {len(df)} tags, {len(disc)} discrepancies")
     return df, disc
 

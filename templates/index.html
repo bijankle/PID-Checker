@@ -10,9 +10,9 @@
   <main class="container">
     <h1>P&amp;ID Consistency Checker</h1>
     <p class="lead">
-      Upload a P&amp;ID PDF and your engineering lists. PID-Checker reads each
-      drawing's number from its title block, finds every line / valve / tie-in /
-      equipment tag on each page, and flags inconsistencies against the lists.
+      Upload the four project files. PID-Checker reads every line, valve and
+      equipment tag off the P&amp;ID drawings and flags anything that is on a
+      drawing but missing from the matching list.
     </p>
 
     {% with messages = get_flashed_messages() %}
@@ -25,18 +25,19 @@
 
     <form action="{{ url_for('check') }}" method="post" enctype="multipart/form-data">
       <fieldset>
-        <legend>P&amp;ID drawings (required)</legend>
-        <label>P&amp;ID PDF
+        <legend>Files (all four required)</legend>
+        <label>P&amp;ID drawings (PDF)
           <input type="file" name="pid_pdf" accept="application/pdf" required>
         </label>
-      </fieldset>
-
-      <fieldset>
-        <legend>Engineering lists (upload any you have)</legend>
-        <label>Line list <input type="file" name="line_list" accept=".xls,.xlsx"></label>
-        <label>Valve list <input type="file" name="valve_list" accept=".xls,.xlsx"></label>
-        <label>Tie-in list <input type="file" name="tie_in_list" accept=".xls,.xlsx"></label>
-        <label>Mechanical equipment list <input type="file" name="equipment_list" accept=".xls,.xlsx"></label>
+        <label>Line List (Excel)
+          <input type="file" name="line_list" accept=".xls,.xlsx" required>
+        </label>
+        <label>Valve List (Excel)
+          <input type="file" name="valve_list" accept=".xls,.xlsx" required>
+        </label>
+        <label>Mechanical Equipment List / MEL (Excel)
+          <input type="file" name="mel" accept=".xls,.xlsx" required>
+        </label>
       </fieldset>
 
       <button type="submit">Run consistency check</button>

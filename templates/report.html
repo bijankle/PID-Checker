@@ -11,58 +11,54 @@
     <h1>Consistency Report</h1>
 
     <section class="summary">
-      <span class="badge error">{{ summary.error }} errors</span>
-      <span class="badge warning">{{ summary.warning }} warnings</span>
-      <span class="badge info">{{ summary.info }} info</span>
+      <span class="badge error">{{ summary['DISCREPANCIES (on P&ID, not in list)'] }} discrepancies</span>
+      <span class="badge info">{{ summary['Equipment found'] }} equipment</span>
+      <span class="badge info">{{ summary['Valves found'] }} valves</span>
+      <span class="badge info">{{ summary['Lines found'] }} lines</span>
+      <span class="badge info">{{ summary['P&ID pages'] }} drawings</span>
       <a class="download" href="{{ url_for('download', run_id=run_id) }}">Download Excel report</a>
       <a class="secondary" href="{{ url_for('index') }}">Run another check</a>
     </section>
 
-    <details class="context">
-      <summary>Drawings detected ({{ pages|length }} pages)</summary>
-      <table>
-        <thead><tr><th>Page</th><th>Drawing No.</th><th>Source</th><th>OCR?</th>
-          <th>Lines</th><th>Valves</th><th>Tie-ins</th><th>Equipment</th></tr></thead>
-        <tbody>
-          {% for p in pages %}
-          <tr>
-            <td>{{ p.page_index + 1 }}</td>
-            <td>{{ p.drawing_number or '—' }}</td>
-            <td>{{ p.drawing_number_source }}</td>
-            <td>{{ 'yes' if p.used_ocr else '' }}</td>
-            <td>{{ p.tags.get('line', [])|length }}</td>
-            <td>{{ p.tags.get('valve', [])|length }}</td>
-            <td>{{ p.tags.get('tie_in', [])|length }}</td>
-            <td>{{ p.tags.get('equipment', [])|length }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </details>
-
-    <h2>Findings</h2>
-    {% if findings %}
+    <h2>Discrepancies — on a P&amp;ID but missing from a list</h2>
+    {% if discrepancies %}
     <table class="findings">
       <thead>
-        <tr><th>Severity</th><th>Type</th><th>Identifier</th>
-          <th>Drawing / Page</th><th>Source</th><th>Message</th></tr>
+        <tr><th>P&amp;ID</th><th>Category</th><th>Tag</th>
+          <th>Checked against</th><th>Status</th></tr>
       </thead>
       <tbody>
-        {% for f in findings %}
-        <tr class="sev-{{ f['Severity'] }}">
-          <td>{{ f['Severity'] }}</td>
-          <td>{{ f['Item Type'] }}</td>
-          <td>{{ f['Identifier'] }}</td>
-          <td>{{ f['Drawing / Page'] }}</td>
-          <td>{{ f['Source'] }}</td>
-          <td>{{ f['Message'] }}</td>
+        {% for d in discrepancies %}
+        <tr class="sev-error">
+          <td>{{ d['P&ID'] }}</td>
+          <td>{{ d['Category'] }}</td>
+          <td>{{ d['Tag'] }}</td>
+          <td>{{ d['Checked Against'] }}</td>
+          <td>{{ d['Status'] }}</td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
     {% else %}
-    <p class="ok">No inconsistencies found. 🎉</p>
+    <p class="ok">No discrepancies — every tag on the drawings is in its list. 🎉</p>
     {% endif %}
+
+    <details class="context">
+      <summary>Full P&amp;ID inventory ({{ inventory|length }} tags) — check completeness</summary>
+      <table>
+        <thead><tr><th>P&amp;ID</th><th>Category</th><th>Tag</th><th>Status</th></tr></thead>
+        <tbody>
+          {% for r in inventory %}
+          <tr class="{{ 'row-bad' if r['Status'] != 'IN LIST' else '' }}">
+            <td>{{ r['P&ID'] }}</td>
+            <td>{{ r['Category'] }}</td>
+            <td>{{ r['Tag'] }}</td>
+            <td>{{ r['Status'] }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
   </main>
 </body>
 </html>
