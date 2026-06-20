@@ -67,15 +67,75 @@ def descriptions_match(pid_desc, mel_desc):
 
 
 # --------------------------------------------------------------------------
-# positional extraction from a page
+# page view: words + lines + text, from the native text layer, falling back to
+# OCR for sheets that have no extractable text (scanned, or text-as-outlines).
 # --------------------------------------------------------------------------
-def drawing_number(page):
-    """Sheet's own number = the FP word nearest the bottom (title block)."""
-    fps = [w for w in page.get_text("words") if RE_FP_FULL.match(w[4])]
+def _native_view(page):
+    lines = []
+    for b in page.get_text("dict")["blocks"]:
+        for l in b.get("lines", []):
+            txt = " ".join(s["text"] for s in l["spans"]).strip()
+            if txt:
+                x0, y0, x1, y1 = l["bbox"]
+                lines.append((x0, y0, x1, y1, txt))
+    return {"W": page.rect.width, "H": page.rect.height,
+            "words": [tuple(w[:5]) for w in page.get_text("words")],
+            "lines": lines, "text": page.get_text("text"), "ocr": False}
+
+
+def _ocr_view(page, dpi=300):
+    import io
+    import pytesseract
+    from PIL import Image
+    pix = page.get_pixmap(dpi=dpi)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    sc = 72.0 / dpi
+    words, lmap = [], {}
+    for i in range(len(data["text"])):
+        t = data["text"][i].strip()
+        if not t:
+            continue
+        x0, y0 = data["left"][i] * sc, data["top"][i] * sc
+        x1 = (data["left"][i] + data["width"][i]) * sc
+        y1 = (data["top"][i] + data["height"][i]) * sc
+        words.append((x0, y0, x1, y1, t))
+        lmap.setdefault((data["block_num"][i], data["par_num"][i], data["line_num"][i]), []).append((x0, y0, x1, y1, t))
+    lines = []
+    for wl in lmap.values():
+        wl.sort(key=lambda z: z[0])
+        lines.append((min(w[0] for w in wl), min(w[1] for w in wl),
+                      max(w[2] for w in wl), max(w[3] for w in wl),
+                      " ".join(w[4] for w in wl)))
+    return {"W": page.rect.width, "H": page.rect.height, "words": words,
+            "lines": lines, "text": "\n".join(w[4] for w in words), "ocr": True}
+
+
+def page_view(page, ocr_threshold=20):
+    nv = _native_view(page)
+    if len(nv["text"].strip()) >= ocr_threshold:
+        return nv
+    try:
+        ov = _ocr_view(page)
+        return ov if ov["words"] else nv
+    except Exception:
+        return nv   # OCR unavailable (no tesseract) — return the empty native view
+
+
+# --------------------------------------------------------------------------
+# positional extraction from a page view
+# --------------------------------------------------------------------------
+def drawing_number(pv):
+    """Sheet's own number = the FP word in the bottom-right title block. Prefer
+    candidates in the bottom-right corner; fall back to the lowest FP anywhere."""
+    fps = [w for w in pv["words"] if RE_FP_FULL.match(w[4])]
     if not fps:
         return None
-    fps.sort(key=lambda w: (w[1], w[0]))   # largest y0 (lowest) wins, then right-most
-    return fps[-1][4]
+    W, H = pv["W"], pv["H"]
+    corner = [w for w in fps if w[0] > 0.6 * W and w[1] > 0.85 * H]
+    pool = corner or fps
+    pool.sort(key=lambda w: (w[1], w[0]))   # lowest, then right-most
+    return pool[-1][4]
 
 
 def _is_tagish(t):
@@ -99,18 +159,12 @@ def _desc_reliable(d):
     return len(re.findall(r"[A-Z]{3,}", d.upper())) >= 2
 
 
-def equipment_descriptions(page):
+def equipment_descriptions(pv):
     """tag -> description, read from the reference block (the 1-3 tightly stacked
     lines directly beneath the tag at the same x). The symbol occurrence has no
     such block, so the longest clean description found across occurrences wins."""
-    H = page.rect.height
-    lines = []
-    for b in page.get_text("dict")["blocks"]:
-        for l in b.get("lines", []):
-            txt = " ".join(s["text"] for s in l["spans"]).strip()
-            if txt:
-                x0, y0, x1, y1 = l["bbox"]
-                lines.append((x0, y0, x1, y1, txt))
+    H = pv["H"]
+    lines = pv["lines"]
     out = {}
     for s in lines:
         tag = s[4].strip().upper()
@@ -134,11 +188,11 @@ def equipment_descriptions(page):
     return out
 
 
-def valve_pairs(page):
+def valve_pairs(pv):
     """unique valve tag (AREA-VV-NNN) -> nearest sized code (<DN>V<nn><L>) on the
     sheet, when within ~5% of sheet width (they sit together at the valve symbol)."""
-    ws = page.get_text("words")
-    W = page.rect.width
+    ws = pv["words"]
+    W = pv["W"]
     sized = [(w[4], (w[0] + w[2]) / 2, (w[1] + w[3]) / 2) for w in ws if RE_VSZ_FULL.match(w[4])]
     out = {}
     for w in ws:
@@ -155,12 +209,12 @@ def valve_pairs(page):
     return out
 
 
-def continuation_ribbons(page):
+def continuation_ribbons(pv):
     """Off-page connectors sit at the left/right border: the target drawing
     number in the flag, with the line number on the same row just inboard.
     Returns a list of (target_drawing, line_tag) for this sheet."""
-    W, H = page.rect.width, page.rect.height
-    ws = page.get_text("words")
+    W, H = pv["W"], pv["H"]
+    ws = pv["words"]
     fps = [w for w in ws if RE_FP_FULL.match(w[4])]
     lns = [w for w in ws if RE_LINE.fullmatch(w[4])]
     out = []
@@ -299,15 +353,16 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
     pages, homes = [], {}
     with fitz.open(pdf_path) as doc:
         for page in doc:
-            dwg = drawing_number(page) or f"(page {page.number + 1})"
-            valves, vvs, lines, eq_counts, other_counts = page_tags(
-                page.get_text("text"), ref["codes"])
+            pv = page_view(page)
+            dwg = drawing_number(pv) or f"(page {page.number + 1})"
+            valves, vvs, lines, eq_counts, other_counts = page_tags(pv["text"], ref["codes"])
             pages.append({
                 "dwg": dwg, "vvs": vvs, "lines": lines,
                 "eq": eq_counts, "other": other_counts,
-                "desc": equipment_descriptions(page),
-                "vpairs": valve_pairs(page),
-                "ribbons": continuation_ribbons(page),
+                "desc": equipment_descriptions(pv),
+                "vpairs": valve_pairs(pv),
+                "ribbons": continuation_ribbons(pv),
+                "ocr": pv["ocr"],
             })
             for tag, c in (eq_counts | other_counts).items():
                 if c >= 2:
@@ -320,23 +375,26 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
 
     # ---- pass 2 ----
     for pg in pages:
-        dwg = pg["dwg"]
+        ocr = pg.get("ocr")
+        dwg = pg["dwg"] + (" (OCR)" if ocr else "")
 
         # Equipment: PID no | MEL no | PID descr | MEL descr | Notes
+        # On OCR'd sheets the drawing number and descriptions are unreliable, so
+        # we recover the tags but suppress the P&ID / description mismatch flags.
         for tag in sorted(pg["eq"]):
-            note = ""
+            note = "read via OCR — verify" if ocr else ""
             if pg["eq"][tag] < 2:
                 if tag in homes:
                     continue
-                note = ONLY_ONCE
+                note = (note + "; " if note else "") + ONLY_ONCE
             in_mel = tag in ref["equipment"]
             if not in_mel:
                 note = (note + "; " if note else "") + "not in MEL"
-            elif tag in declared and declared[tag] != dwg:
+            elif (not ocr) and tag in declared and declared[tag] != pg["dwg"]:
                 note = (note + "; " if note else "") + f"MEL P&ID = {declared[tag]}"
             pid_desc = pg["desc"].get(tag, "")
             mel_desc = names.get(tag, "")
-            desc_bad = (in_mel and _desc_reliable(pid_desc) and bool(mel_desc)
+            desc_bad = (not ocr and in_mel and _desc_reliable(pid_desc) and bool(mel_desc)
                         and not descriptions_match(pid_desc, mel_desc))
             eq_rows.append([dwg, tag, tag if in_mel else "", pid_desc, mel_desc, note])
             eq_mask.append([False, False, not in_mel, desc_bad, desc_bad, bool(note)])

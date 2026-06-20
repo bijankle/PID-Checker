@@ -52,11 +52,23 @@ python tests/test_check_project.py
 Generates tiny synthetic files in the project's tag style and checks the
 side-by-side tables, the twice-rule, description extraction and valve pairing.
 
-## Known limitations / in progress
+## Continuation-ribbon check
 
-- **Continuation-ribbon check** (verifying that a line's off-page connector
-  points to the right drawing) is not done yet — the connector geometry needs
-  more work and the full drawing set to validate.
+Off-page connectors (border flags) are read as `target-drawing + line-number`,
+and each is verified against where that line actually appears: a ribbon that
+names a drawing which doesn't carry the line is flagged. Shown on the
+**Continuations** sheet.
+
+## OCR fallback
+
+Sheets with no text layer (scanned, or text saved as vector outlines) fall back
+to OCR (Tesseract). Tags are recovered but the drawing number / descriptions are
+unreliable, so those rows are marked **"read via OCR — verify"** and their
+P&ID/description mismatch checks are suppressed. Best to re-export such a sheet
+with real text when you can.
+
+## Known limitations
+
 - **Description extraction** is best-effort; a small number of equipment that
   sit in vendor-package blocks may read the wrong description.
 - Instrument/actuated valve loop tags (`YV-`/`SV-` balloons) are out of scope.
