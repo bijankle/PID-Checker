@@ -76,6 +76,8 @@ tbody tr:hover{background:var(--panel2);}
 td.tag{font-family:var(--mono);font-size:12.5px;color:var(--text);white-space:nowrap;}
 td.note{color:var(--muted);font-size:12.5px;}
 td.bad{background:var(--red-bg);color:var(--red-tx);font-weight:600;}
+.grid{table-layout:fixed;width:auto;}
+.grid td,.grid th{white-space:normal;overflow-wrap:anywhere;word-break:break-word;vertical-align:top;}
 .empty{padding:16px;color:var(--green-tx);background:var(--green-bg);border-radius:8px;font-weight:600;display:inline-block;margin:4px 0;}
 .flash{background:var(--red-bg);border:1px solid var(--red-bd);color:var(--red-tx);padding:10px 14px;border-radius:8px;margin:12px 0;}
 details>summary{cursor:pointer;font-weight:600;color:var(--sub2);margin:10px 0;}
@@ -430,17 +432,22 @@ function paintTab(){
 }
 const ICON_COPY='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const ICON_DL='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+const TAGCOLS=new Set(["PID Equip No","MEL Equip No","PID Valve Tag","List Valve Tag",
+  "PID Size Code","List Size Code","PID Line No","List Line No","PID P&IDs","List P&ID","P&ID","Tag",
+  "Line No (from)","Line No (to)","P&ID (from)","P&ID (to)","Sheet","Ribbon → Drawing"]);
 function tableHtml(t,idx){
-  const tagCols=new Set(["PID Equip No","MEL Equip No","PID Valve Tag","List Valve Tag",
-    "PID Size Code","List Size Code","PID Line No","List Line No","PID P&IDs","List P&ID","P&ID","Tag",
-    "Line No (from)","Line No (to)","P&ID (from)","P&ID (to)","Sheet","Ribbon → Drawing"]);
-  let h="<table><thead><tr>"+t.cols.map(c=>`<th>${esc(c)}</th>`).join("")+"</tr></thead><tbody>";
+  // stack P&ID lists on separate lines, then size columns by content (fixed layout)
+  const disp=t.rows.map(r=>r.map((v,ci)=>PID_LIST_COLS.has(t.cols[ci])?String(v).split(", ").join("\n"):String(v??"")));
+  const widths=t.cols.map((c,ci)=>colWidth(c,disp.map(r=>r[ci]))+2);
+  const totalW=widths.reduce((a,b)=>a+b,0)+2;
+  let h=`<table class="grid" style="width:${totalW}ch"><colgroup>`+widths.map(w=>`<col style="width:${w}ch">`).join("")+"</colgroup>";
+  h+="<thead><tr>"+t.cols.map(c=>`<th>${esc(c)}</th>`).join("")+"</tr></thead><tbody>";
   if(!idx.length) h+=`<tr><td colspan="${t.cols.length}" class="note" style="padding:16px;">No flagged rows in this tab. 🎉</td></tr>`;
-  for(const ri of idx){const row=t.rows[ri];
-    h+="<tr>"+row.map((c,ci)=>{
+  for(const ri of idx){
+    h+="<tr>"+t.cols.map((c,ci)=>{
       const cls=[]; if(t.mask[ri]&&t.mask[ri][ci])cls.push("bad");
-      if(t.cols[ci]==="Notes")cls.push("note"); else if(tagCols.has(t.cols[ci]))cls.push("tag");
-      return `<td class="${cls.join(' ')}">${esc(c)}</td>`;
+      if(c==="Notes")cls.push("note"); else if(TAGCOLS.has(c))cls.push("tag");
+      return `<td class="${cls.join(' ')}">${esc(disp[ri][ci]).split("\n").join("<br>")}</td>`;
     }).join("")+"</tr>";}
   return h+"</tbody></table>";
 }
