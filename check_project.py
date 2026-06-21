@@ -468,21 +468,69 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
     return {"tables": tables, "masks": masks, "summary": summary}
 
 
+PID_LIST_COLS = {"PID P&IDs", "List P&ID"}
+
+
+def _col_width(header, cells):
+    """Tag/code/P&ID columns hug their longest token; free-text columns size to
+    ~their 90th-percentile line length (capped) so they stay readable without
+    big blank space."""
+    segs, tokenish = [], True
+    for v in cells:                       # judge tokenish from values, not the header
+        s = str(v) if v is not None else ""
+        for seg in s.split("\n"):         # each stacked line is its own segment
+            if " " in seg.strip():
+                tokenish = False
+            segs.append(len(seg))
+    if not segs:
+        segs = [0]
+    segs.sort()
+    hlen = len(str(header))
+    maxlen = segs[-1]
+    p90 = segs[min(len(segs) - 1, int(len(segs) * 0.9))]
+    if tokenish:
+        return min(max(maxlen, hlen) + 2, 16)
+    return min(max(p90, hlen, 18) + 1, 46)
+
+
 def write_report(result, out_path):
-    """Write one sheet per item type, red-filling cells flagged in the mask."""
-    from openpyxl.styles import PatternFill
-    red = PatternFill("solid", fgColor="FFC7CE")
+    """One sheet per item type: themed header, red-filled mismatches, wrap text,
+    frozen + filtered top row, P&IDs stacked on separate lines, tuned widths."""
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    red_fill = PatternFill("solid", fgColor="FFFCEDED")
+    red_font = Font(color="FFA82C2E", bold=True)
+    head_fill = PatternFill("solid", fgColor="FF5865F2")
+    head_font = Font(color="FFFFFFFF", bold=True)
+    thin = Side(style="thin", color="FFE3E5E8")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    sheets = [("Summary", result["summary"], None)]
+    sheets += [(n, result["tables"][n], result["masks"][n])
+               for n in ("Equipment", "Valves", "Lines", "Continuations", "Other", "Manual Review")]
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-        result["summary"].to_excel(xw, sheet_name="Summary", index=False)
-        for name in ("Equipment", "Valves", "Lines", "Continuations", "Other", "Manual Review"):
-            df = result["tables"][name]
-            df.to_excel(xw, sheet_name=name, index=False)
-            mask = result["masks"][name]
+        for name, df, mask in sheets:
+            disp = df.copy()
+            for c in disp.columns:
+                if c in PID_LIST_COLS:
+                    disp[c] = disp[c].map(lambda v: str(v).replace(", ", "\n"))
+            disp.to_excel(xw, sheet_name=name, index=False)
             ws = xw.sheets[name]
-            for ri in range(len(df)):
-                for ci in range(len(df.columns)):
-                    if bool(mask.iat[ri, ci]):
-                        ws.cell(row=ri + 2, column=ci + 1).fill = red
+            ncols = len(disp.columns)
+            for ci, col in enumerate(disp.columns, start=1):
+                hc = ws.cell(row=1, column=ci)
+                hc.fill, hc.font, hc.border, hc.alignment = head_fill, head_font, border, wrap
+            for ri in range(len(disp)):
+                for ci in range(ncols):
+                    cell = ws.cell(row=ri + 2, column=ci + 1)
+                    cell.border, cell.alignment = border, wrap
+                    if mask is not None and bool(mask.iat[ri, ci]):
+                        cell.fill, cell.font = red_fill, red_font
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{len(disp) + 1}"
+            for ci, col in enumerate(disp.columns, start=1):
+                ws.column_dimensions[get_column_letter(ci)].width = _col_width(col, disp[col].tolist())
 
 
 def check(pdf_path, line_path, valve_path, mel_path, out_path="PID_Check_Report.xlsx"):
