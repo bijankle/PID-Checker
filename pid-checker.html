@@ -450,32 +450,17 @@ function tableHtml(t,idx){
     }).join("")+"</tr>";}
   return h+"</tbody></table>";
 }
-// ---- Copy all tabs into one clipboard table, side by side ----
+// ---- Copy the current tab's table (respecting the flag toggle) ----
 function copyAll(){
   if(!RESULT) return;
-  const names=TAB_ORDER.filter(n=>RESULT.tables[n]&&RESULT.tables[n].rows.length);
-  const HD='background:#5865F2;color:#ffffff;font-weight:700;padding:5px 9px;border:1px solid #E3E5E8;';
-  const COL='background:#F2F3F5;color:#4E5058;font-weight:700;padding:5px 9px;border:1px solid #E3E5E8;';
+  const t=RESULT.tables[CURRENT_TAB];
+  const idx=t.rows.map((_,i)=>i).filter(i=>!ONLY_FLAG||rowFlagged(t,i));
+  const COL='background:#5865F2;color:#ffffff;font-weight:700;padding:5px 9px;border:1px solid #E3E5E8;';
   const CELL='padding:4px 9px;border:1px solid #E3E5E8;';
   const BAD='background:#FCEDED;color:#A82C2E;font-weight:700;';
-  const SP='border:none;width:24px;';     // narrow empty spacer column
   let h='<table style="border-collapse:collapse;font:13px Aptos,Segoe UI,sans-serif;color:#2E3035;">';
-  // section-title row
-  h+='<tr>'+names.map((n,si)=>`<td colspan="${RESULT.tables[n].cols.length}" style="${HD}">${esc(SEC[n].title)}</td>`
-        +(si<names.length-1?`<td style="${SP}"></td>`:'')).join('')+'</tr>';
-  // column-header row
-  h+='<tr>'+names.map((n,si)=>RESULT.tables[n].cols.map(c=>`<td style="${COL}">${esc(c)}</td>`).join('')
-        +(si<names.length-1?`<td style="${SP}"></td>`:'')).join('')+'</tr>';
-  // data rows
-  const maxR=Math.max(...names.map(n=>RESULT.tables[n].rows.length));
-  for(let r=0;r<maxR;r++){
-    h+='<tr>'+names.map((n,si)=>{
-      const t=RESULT.tables[n]; let cells;
-      if(r<t.rows.length) cells=t.rows[r].map((c,ci)=>`<td style="${CELL}${(t.mask[r]&&t.mask[r][ci])?BAD:''}">${esc(c)}</td>`).join('');
-      else cells=t.cols.map(()=>`<td style="${CELL}"></td>`).join('');
-      return cells+(si<names.length-1?`<td style="${SP}"></td>`:'');
-    }).join('')+'</tr>';
-  }
+  h+='<tr>'+t.cols.map(c=>`<td style="${COL}">${esc(c)}</td>`).join('')+'</tr>';
+  for(const ri of idx) h+='<tr>'+t.rows[ri].map((c,ci)=>`<td style="${CELL}${(t.mask[ri]&&t.mask[ri][ci])?BAD:''}">${esc(c)}</td>`).join('')+'</tr>';
   h+='</table>';
   // rich copy via a temporary selection (works from a double-clicked file://)
   const div=document.createElement('div');
