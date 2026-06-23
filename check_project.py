@@ -220,11 +220,13 @@ def load_references(line_path, valve_path, mel_path):
             if v and v.lower() != "nan":
                 names[m.group(0)] = v
 
-    # Valves: the unique VV tag and its paired size code, plus the full id set.
-    valves, vv_set, vv_to_size = set(), set(), {}
+    # Valves: the unique VV tag and its paired size code, the P&ID the valve list
+    # assigns it to, plus the full id set.
+    valves, vv_set, vv_to_size, vv_pid = set(), set(), {}, {}
     vmain = pd.read_excel(valve_path, sheet_name="2233-PLST-007", header=0, dtype=str)
     patt_col = _find_col(vmain.columns, "PATTERN")
     name_lk = _find_col(vmain.columns, "Valve Name Lookup")
+    vpid_col = _find_col(vmain.columns, "P&ID", "P&ID No.", "P&ID\nNo.", "PID No.", "PID")
     for col in ("Valve Identifier", "Valve Name Lookup", "PATTERN"):
         if col in vmain.columns:
             valves |= {str(v).strip().upper() for v in vmain[col].dropna()}
@@ -235,6 +237,9 @@ def load_references(line_path, valve_path, mel_path):
             nm = str(r.get(name_lk)).strip().upper() if name_lk else ""
             if RE_VSZ_FULL.match(nm):
                 vv_to_size[patt] = nm
+            if vpid_col is not None:
+                for dm in RE_DWG.findall(str(r.get(vpid_col)).upper()):
+                    vv_pid.setdefault(patt, set()).add(dm)
     for sheet, col in (("Actuated Valves", "TAG"), ("Actuated Valves", "Valve Code"),
                        ("Manual Valves", "Valve Tag")):
         try:
@@ -249,9 +254,10 @@ def load_references(line_path, valve_path, mel_path):
     # everything on (service, sequential) and record which P&ID(s) the list
     # assigns each line to, plus the list's own line identifier.
     ll = pd.read_excel(line_path, sheet_name="Line List", header=0, dtype=str).iloc[1:]
-    serv_num, line_pid, line_ident = set(), {}, {}
+    serv_num, line_pid, line_ident, line_spec = set(), {}, {}, {}
     pidc = _find_col(ll.columns, "P&ID", "PID")
     ident_col = _find_col(ll.columns, "Identifier")
+    spec_col = _find_col(ll.columns, "SPEC", "PIPE SPEC", "PIPING SPEC")
 
     for _, r in ll.iterrows():
         pids = set(RE_DWG.findall(str(r.get(pidc)).upper())) if pidc else set()
@@ -264,6 +270,9 @@ def load_references(line_path, valve_path, mel_path):
             ident = str(r.get(ident_col)).strip() if ident_col else ""
             if ident and ident.lower() != "nan":
                 line_ident.setdefault(key, ident)
+            if spec_col is not None:
+                for sm in re.findall(r"[A-Z]\d{2}", str(r.get(spec_col)).upper()):
+                    line_spec.setdefault(key, set()).add(sm)
         for c in ll.columns:   # harvest fully-written line numbers in any cell
             for m in RE_LINE.finditer(str(r.get(c)).upper()):
                 k = (m.group(2), str(int(m.group(4))))
@@ -271,9 +280,9 @@ def load_references(line_path, valve_path, mel_path):
                 line_pid.setdefault(k, set())
 
     return {"equipment": equipment, "codes": codes, "valves": valves,
-            "vv_set": vv_set, "vv_to_size": vv_to_size, "serv_num": serv_num,
-            "line_pid": line_pid, "line_ident": line_ident,
-            "declared_pid": declared_pid, "names": names}
+            "vv_set": vv_set, "vv_to_size": vv_to_size, "vv_pid": vv_pid,
+            "serv_num": serv_num, "line_pid": line_pid, "line_ident": line_ident,
+            "line_spec": line_spec, "declared_pid": declared_pid, "names": names}
 
 
 def page_tags(text, codes):
@@ -334,6 +343,8 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
                 if c >= 2:
                     homes.setdefault(tag, set()).add(dwg)
 
+    all_dwgs = {pg["dwg"] for pg in pages}
+
     eq_rows, eq_mask = [], []
     vl_rows, vl_mask = [], []
     ln_rows, ln_mask = [], []
@@ -376,9 +387,14 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
             pid_size = pg["vpairs"].get(vv, "")
             list_size = ref["vv_to_size"].get(vv, "")
             size_bad = bool(pid_size) and bool(list_size) and pid_size != list_size
-            note = "" if in_list else "not in valve list"
+            # wrong-P&ID: the valve is drawn on a sheet the valve list doesn't
+            # assign it to (the list names one or more different P&IDs).
+            vp = ref["vv_pid"].get(vv, set())
+            pid_bad = in_list and bool(vp) and dwg not in vp
+            note = ("not in valve list" if not in_list
+                    else (f"valve list P&ID = {', '.join(sorted(vp))}" if pid_bad else ""))
             vl_rows.append([dwg, vv, vv if in_list else "", pid_size, list_size, note])
-            vl_mask.append([False, False, not in_list, size_bad, size_bad, bool(note)])
+            vl_mask.append([pid_bad, False, not in_list, size_bad, size_bad, bool(note)])
 
     # Lines are grouped across the whole document by (service, sequential), so a
     # continuation line spanning two sheets is one row capturing both P&IDs.
@@ -396,13 +412,38 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
             list_no = key[0] + key[1]
         pid_pids = sorted(g["pids"])
         list_pids = sorted(ref["line_pid"].get(key, set()))
-        # red only if the line is drawn on a sheet the line-list P&ID doesn't include
-        pids_bad = matched and bool(list_pids) and not set(pid_pids).issubset(set(list_pids))
-        note = "not in line list" if not matched else (
-            "drawn on a P&ID not in the line list" if pids_bad else "")
+        # Pipe spec is read from the tag itself (the <spec> segment, e.g. S31) and
+        # compared to the line list's spec. Spec legitimately changes along a line
+        # (reducers / spec breaks), so flag only a true disagreement — drawn and
+        # listed specs sharing nothing in common.
+        pid_specs = sorted({RE_LINE.fullmatch(t).group(3)
+                            for t in g["tags"] if RE_LINE.fullmatch(t)})
+        list_specs = sorted(ref["line_spec"].get(key, set())) if matched else []
+        spec_bad = (matched and bool(pid_specs) and bool(list_specs)
+                    and not (set(pid_specs) & set(list_specs)))
+        # Coverage, both directions:
+        #   drawn-not-listed : a sheet the line is drawn on isn't in its list P&IDs
+        #   listed-not-drawn : a list P&ID that IS in the uploaded set carries no
+        #                      drawing of the line
+        drawn_not_listed = matched and bool(list_pids) and not set(pid_pids).issubset(set(list_pids))
+        listed_not_drawn = sorted({p for p in list_pids
+                                   if p in all_dwgs and p not in g["pids"]}) if matched else []
+        pids_bad = drawn_not_listed or bool(listed_not_drawn)
+        notes = []
+        if not matched:
+            notes.append("not in line list")
+        if drawn_not_listed:
+            notes.append("drawn on a P&ID not in the line list")
+        if listed_not_drawn:
+            notes.append("listed on " + ", ".join(listed_not_drawn) + " but not drawn there")
+        if spec_bad:
+            notes.append("spec disagreement")
+        note = "; ".join(notes)
         ln_rows.append([" / ".join(sorted(g["tags"])), list_no,
+                        ", ".join(pid_specs), ", ".join(list_specs),
                         ", ".join(pid_pids), ", ".join(list_pids), note])
-        ln_mask.append([False, not matched, pids_bad, pids_bad, bool(note)])
+        ln_mask.append([False, not matched, spec_bad, spec_bad,
+                        pids_bad, pids_bad, bool(note)])
 
     # Continuations: each off-page ribbon (on a sheet, naming a target drawing
     # and a line) is checked strictly — the named drawing must carry that exact
@@ -433,7 +474,8 @@ def analyze(pdf_path, line_path, valve_path, mel_path):
 
     eq_cols = ["P&ID", "PID Equip No", "MEL Equip No", "PID Description", "MEL Description", "Notes"]
     vl_cols = ["P&ID", "PID Valve Tag", "List Valve Tag", "PID Size Code", "List Size Code", "Notes"]
-    ln_cols = ["PID Line No", "List Line No", "PID P&IDs", "List P&ID", "Notes"]
+    ln_cols = ["PID Line No", "List Line No", "PID Spec", "List Spec",
+               "PID P&IDs", "List P&ID", "Notes"]
     ot_cols = ["P&ID", "Tag", "Status", "Notes"]
     ct_cols = ["Line No (from)", "Line No (to)", "P&ID (from)", "P&ID (to)", "Status"]
     mr_cols = ["Sheet", "Issue"]

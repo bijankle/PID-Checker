@@ -200,8 +200,8 @@ async function rowsOf(file,sheet,skipFirst){
 
 // ---------- references ----------
 async function buildReferences(){
-  const ref={equip:new Set(),codes:new Set(),valves:new Set(),vvSet:new Set(),vvSize:{},
-             servNum:new Set(),linePid:{},lineIdent:{},declared:{},names:{}};
+  const ref={equip:new Set(),codes:new Set(),valves:new Set(),vvSet:new Set(),vvSize:{},vvPid:{},
+             servNum:new Set(),linePid:{},lineIdent:{},lineSpec:{},declared:{},names:{}};
   if(store.mel){
     const rows=await rowsOf(store.mel.file,"Equipment List");
     const eqK=rows.length?(fk(rows[0],"Equipment No.")||"Equipment No."):"Equipment No.";
@@ -213,19 +213,23 @@ async function buildReferences(){
   if(store.valve){
     const wb=XLSX.read(await store.valve.file.arrayBuffer(),{type:"array"});
     const vm=XLSX.utils.sheet_to_json(wb.Sheets["2233-PLST-007"]||wb.Sheets[wb.SheetNames[0]],{defval:"",raw:false});
+    const vpidK=vm.length?fk(vm[0],"P&ID","P&ID No.","PID No.","PID"):null;
     for(const r of vm){for(const c of ["Valve Identifier","Valve Name Lookup","PATTERN"]){if(c in r){const v=U(r[c]);if(v)ref.valves.add(v);}}
-      const patt=U(r["PATTERN"]),nm=U(r["Valve Name Lookup"]);if(VVF.test(patt)){ref.vvSet.add(patt);if(VSZF.test(nm))ref.vvSize[patt]=nm;}}
+      const patt=U(r["PATTERN"]),nm=U(r["Valve Name Lookup"]);if(VVF.test(patt)){ref.vvSet.add(patt);if(VSZF.test(nm))ref.vvSize[patt]=nm;
+        if(vpidK){for(const m of String(r[vpidK]||"").toUpperCase().matchAll(DWGg))(ref.vvPid[patt]=ref.vvPid[patt]||new Set()).add(m[1]);}}}
     for(const [sh,c] of [["Actuated Valves","TAG"],["Actuated Valves","Valve Code"],["Manual Valves","Valve Tag"]]){
       try{for(const r of XLSX.utils.sheet_to_json(wb.Sheets[sh],{defval:"",raw:false}))if(c in r){const v=U(r[c]);if(v)ref.valves.add(v);}}catch(e){}}
     ["","NAN","-","SPARE"].forEach(x=>ref.valves.delete(x));
   }
   if(store.line){
     const rows=await rowsOf(store.line.file,"Line List",true);
-    const pc=rows.length?fk(rows[0],"P&ID","PID"):null, ic=rows.length?fk(rows[0],"Identifier"):null;
+    const pc=rows.length?fk(rows[0],"P&ID","PID"):null, ic=rows.length?fk(rows[0],"Identifier"):null,
+          sc=rows.length?fk(rows[0],"SPEC","PIPE SPEC","PIPING SPEC"):null;
     for(const r of rows){const pids=new Set([...String(r[pc]||"").toUpperCase().matchAll(DWGg)].map(m=>m[1]));
       const serv=U(r["SERV CODE"]),num=dg(r["LINE No."]);
       if(serv&&num){const k=serv+"|"+String(parseInt(num,10));ref.servNum.add(k);(ref.linePid[k]=ref.linePid[k]||new Set());pids.forEach(p=>ref.linePid[k].add(p));
-        const id=String(r[ic]||"").trim();if(id&&id.toLowerCase()!=="nan"&&!(k in ref.lineIdent))ref.lineIdent[k]=id;}
+        const id=String(r[ic]||"").trim();if(id&&id.toLowerCase()!=="nan"&&!(k in ref.lineIdent))ref.lineIdent[k]=id;
+        if(sc){for(const m of String(r[sc]||"").toUpperCase().matchAll(/[A-Z]\d{2}/g))(ref.lineSpec[k]=ref.lineSpec[k]||new Set()).add(m[0]);}}
       for(const c in r){for(const m of String(r[c]).toUpperCase().matchAll(RE_LINE)){const k=m[2]+"|"+String(parseInt(m[4],10));ref.servNum.add(k);ref.linePid[k]=ref.linePid[k]||new Set();}}}
   }
   return ref;
@@ -304,7 +308,7 @@ async function analyze(){
 
   const EQc=["P&ID","PID Equip No","MEL Equip No","PID Description","MEL Description","Notes"];
   const VLc=["P&ID","PID Valve Tag","List Valve Tag","PID Size Code","List Size Code","Notes"];
-  const LNc=["PID Line No","List Line No","PID P&IDs","List P&ID","Notes"];
+  const LNc=["PID Line No","List Line No","PID Spec","List Spec","PID P&IDs","List P&ID","Notes"];
   const OTc=["P&ID","Tag","Status","Notes"];
   const eq={cols:EQc,rows:[],mask:[]}, vl={cols:VLc,rows:[],mask:[]},
         ln={cols:LNc,rows:[],mask:[]}, ot={cols:OTc,rows:[],mask:[]};
@@ -327,20 +331,32 @@ async function analyze(){
     if(store.valve) for(const vv of [...pg.vvs].sort()){
       const inList=ref.vvSet.has(vv)||ref.valves.has(vv);
       const ps=pg.vp[vv]||"",ls=ref.vvSize[vv]||"",sb=!!ps&&!!ls&&ps!==ls;
-      vl.rows.push([dwg,vv,inList?vv:"",ps,ls,inList?"":"not in valve list"]);
-      vl.mask.push([0,0,!inList,sb,sb,!inList]);}
+      const vp=ref.vvPid[vv]; const pidBad=inList&&vp&&vp.size>0&&!vp.has(dwg);
+      const note=!inList?"not in valve list":(pidBad?("valve list P&ID = "+[...vp].sort().join(", ")):"");
+      vl.rows.push([dwg,vv,inList?vv:"",ps,ls,note]);
+      vl.mask.push([pidBad,0,!inList,sb,sb,!!note]);}
   }
   if(store.line){
-    const lg={};
+    const lg={}, dwgSet=new Set(pages.map(pg=>pg.dwg));
     for(const pg of pages)for(const tag of pg.lines){const m=tag.match(/(\d{2,4})-([A-Z]{2,3})-([A-Z]\d{2})-(\d{3})/);
-      const k=m[2]+"|"+String(parseInt(m[4],10));(lg[k]=lg[k]||{tags:new Set(),pids:new Set()});lg[k].tags.add(tag);lg[k].pids.add(pg.dwg);}
+      const k=m[2]+"|"+String(parseInt(m[4],10));(lg[k]=lg[k]||{tags:new Set(),pids:new Set(),specs:new Set()});
+      lg[k].tags.add(tag);lg[k].pids.add(pg.dwg);lg[k].specs.add(m[3]);}
     for(const k of Object.keys(lg).sort()){const g=lg[k];const matched=ref.servNum.has(k);
       let listNo=matched?(ref.lineIdent[k]||(k.split("|")[0]+k.split("|")[1])):"";
       const pp=[...g.pids].sort(), lp=[...(ref.linePid[k]||new Set())].sort();
-      const bad=matched&&lp.length>0&&!pp.every(x=>lp.includes(x));
-      const note=!matched?"not in line list":(bad?"drawn on a P&ID not in the line list":"");
-      ln.rows.push([[...g.tags].sort().join(" / "),listNo,pp.join(", "),lp.join(", "),note]);
-      ln.mask.push([0,!matched,bad,bad,!!note]);}
+      const ps=[...g.specs].sort(), ls=matched?[...(ref.lineSpec[k]||new Set())].sort():[];
+      const specBad=matched&&ps.length>0&&ls.length>0&&!ps.some(x=>ls.includes(x));
+      const drawnNotListed=matched&&lp.length>0&&!pp.every(x=>lp.includes(x));
+      const listedNotDrawn=matched?lp.filter(p=>dwgSet.has(p)&&!g.pids.has(p)):[];
+      const pidBad=drawnNotListed||listedNotDrawn.length>0;
+      const notes=[];
+      if(!matched)notes.push("not in line list");
+      if(drawnNotListed)notes.push("drawn on a P&ID not in the line list");
+      if(listedNotDrawn.length)notes.push("listed on "+listedNotDrawn.join(", ")+" but not drawn there");
+      if(specBad)notes.push("spec disagreement");
+      const note=notes.join("; ");
+      ln.rows.push([[...g.tags].sort().join(" / "),listNo,ps.join(", "),ls.join(", "),pp.join(", "),lp.join(", "),note]);
+      ln.mask.push([0,!matched,specBad,specBad,pidBad,pidBad,!!note]);}
   }
   // Continuations: strict — the ribbon's named drawing must carry that exact
   // line (fluid+sequential). Line No (to) is the line as found on the target.
@@ -433,7 +449,7 @@ function paintTab(){
 const ICON_COPY='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const ICON_DL='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 const TAGCOLS=new Set(["PID Equip No","MEL Equip No","PID Valve Tag","List Valve Tag",
-  "PID Size Code","List Size Code","PID Line No","List Line No","PID P&IDs","List P&ID","P&ID","Tag",
+  "PID Size Code","List Size Code","PID Line No","List Line No","PID Spec","List Spec","PID P&IDs","List P&ID","P&ID","Tag",
   "Line No (from)","Line No (to)","P&ID (from)","P&ID (to)","Sheet","Ribbon → Drawing"]);
 function tableHtml(t,idx){
   // stack P&ID lists on separate lines, then size columns by content (fixed layout)

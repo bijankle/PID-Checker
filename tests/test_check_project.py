@@ -115,11 +115,12 @@ def test_analyze(tmp_path):
     assert v["List Valve Tag"] == "120-VV-003"
     assert v["PID Size Code"] == "25V41A" and v["List Size Code"] == "25V41A"
 
-    # --- Lines: grouped by service+sequential, Line|Line|P&ID|P&ID order ---
-    assert list(ln.columns) == ["PID Line No", "List Line No", "PID P&IDs",
-                                "List P&ID", "Notes"]
+    # --- Lines: grouped by service+sequential, with spec compared side by side ---
+    assert list(ln.columns) == ["PID Line No", "List Line No", "PID Spec",
+                                "List Spec", "PID P&IDs", "List P&ID", "Notes"]
     li = _row(ln, "PID Line No", "25-PW-S31-027")
     assert li["List Line No"] == "PW27"          # the line-list identifier
+    assert li["PID Spec"] == "S31" and li["List Spec"] == "S31"   # specs agree
     assert "120-FP-001" in li["PID P&IDs"] and "120-FP-001" in li["List P&ID"]
 
 
